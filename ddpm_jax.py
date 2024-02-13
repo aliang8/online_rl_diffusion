@@ -359,7 +359,7 @@ class Trainer:
         else:
             self.wandb_run = None
 
-    def step(self, batch_size: int):
+    def step(self):
         """Performs one training step"""
         self._step_rng, rng = random.split(self._step_rng)
         self._state, metrics = self._update_fn(self._state, rng)
@@ -368,7 +368,6 @@ class Trainer:
 
         meta = {
             "step": self.global_step,
-            "epoch": self.global_step // batch_size,
             "learning_rate": self._lr_schedule(self.global_step),
         }
         return metrics, meta
@@ -395,6 +394,7 @@ class Trainer:
             self._init_rng, 4
         )
 
+        # batch size 1 and action_dim 1, sample model input
         x_0 = jax.random.normal(rng_init, (1, 1), dtype=self._dtype)
         x_t, t, _ = self._diffuser.forward(x_0, rng_diffusion)
         model = TimeConditionedMLP(dim=16, dtype=self._dtype)
@@ -432,15 +432,22 @@ class Trainer:
         return self._state.apply_fn(params, x, t, train, rngs=rngs)
 
     def reward(self, x: ndarray):
-        # bandit reward function
+        # bandit reward function, a gaussian centered at 0
         y1 = jnp.clip(-18 * (0.5 * x) ** 2 + 1.1, a_min=0)
         return y1
 
     def _loss_fn(self, params: Params, x: ndarray, t: ndarray, eps: ndarray, rng: Rng):
         pred = self._forward_fn(params, x, t, train=True, rng=rng)
-        r = self.reward(pred)
+
+        # bandit reward, with reward_weight
+        r = self.reward(x) * 0.1
+
+        # loss is the l2 between predicted noise and actual noise
         ddpm_loss = optax.l2_loss(pred, eps)
+
+        # policy gradient loss is -(ddpm_loss * reward)
         loss = -(ddpm_loss * r).mean()
+
         metrics = {
             "ddpm_loss": ddpm_loss.mean(),
             "reward": r.mean(),
@@ -459,7 +466,7 @@ class Trainer:
         # compute forward process
         x_t, t, eps = self._diffuser.forward(x_0, rng2)
 
-        # compute noise reconstruction loss
+        # compute noise reconstruction loss objective
         grads, metrics = grad_loss_fn(state.params, x_t, t, eps, rng3)
         state = state.apply_gradients(grads=grads)
         return state, metrics
