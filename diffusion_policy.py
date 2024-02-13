@@ -386,7 +386,10 @@ class DiffusionBandit(nn.Module):
         x_recon = self.predict_start_from_noise(x, t=t, noise=self.model(x, t))
 
         if self.clip_denoised:
-            x_recon.clamp_(-self.max_action, self.max_action)
+            # apply tanh
+            x_recon = torch.tanh(x_recon)
+
+            # x_recon.clamp_(-self.max_action, self.max_action)
         else:
             assert RuntimeError()
 
@@ -470,6 +473,13 @@ class DiffusionBandit(nn.Module):
         batch_size = len(x)
         t = torch.randint(0, self.n_timesteps, (batch_size,), device=x.device).long()
         return self.p_losses(x, t, weights)
+
+    def log_prob(self, x):
+        # compute loss for all t and average
+        loss = 0
+        for t in range(self.n_timesteps):
+            loss += self.p_losses(x, t)
+        return loss / self.n_timesteps
 
     def forward(self, batch_size, *args, **kwargs):
         return self.sample(batch_size, *args, **kwargs)
