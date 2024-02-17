@@ -1,0 +1,10 @@
+dm_haiku
+ml_collections
+optax 
+orbax
+matplotlib
+IPython
+ipdb
+imageio
+moviepy
+ipywidgets
