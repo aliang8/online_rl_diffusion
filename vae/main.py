@@ -25,17 +25,17 @@ def get_config():
     action_dim = 1
     grad_acc = FieldReference(1)
 
-    config.training_steps = FieldReference(50000)
+    config.training_steps = FieldReference(5000)
     config.seed = seed
     config.ckpt_dir = "/scr/aliang80/changepoint_aug/online_rl_diffusion/results"
     config.log_interval = 500
     config.ckpt_interval = 5000
     config.eval_interval = 1000
-    config.visualize_every = 1000
+    config.visualize_every = 100
     config.action_dim = action_dim
     config.batch_size = 128
     config.entropy_weight = 0.2
-    config.entropy_decay_rate = 0.99995
+    config.entropy_decay_rate = 0.9995
 
     config.experiment_kwargs = ConfigDict(
         dict(
@@ -45,8 +45,8 @@ def get_config():
             batch_size=config.batch_size,
             ckpt_dir=config.ckpt_dir,
             lr=1e-3,
-            kl_weight=5e-2,
-            reward_weight=1,
+            kl_weight=1e-3,
+            reward_weight=0.1,
             train=dict(
                 optimizer=dict(
                     optimizer_type="adam",
@@ -62,11 +62,11 @@ def get_config():
             ),
             model=dict(
                 encoder=dict(
-                    hidden_size1=50,
-                    hidden_size2=25,
-                    latent_size=10,
+                    hidden_size1=16,
+                    hidden_size2=16,
+                    latent_size=4,
                 ),
-                decoder=dict(hidden_size1=50, hidden_size2=25, action_dim=action_dim),
+                decoder=dict(hidden_size1=16, hidden_size2=16, action_dim=action_dim),
             ),
         )
     )
@@ -93,7 +93,14 @@ if __name__ == "__main__":
     entropy_weight = config.entropy_weight
 
     for step in range(config.training_steps):
-        input = trainer._sample(state, config.batch_size)
+        # create linspace
+        input = jnp.linspace(-1, 1, 5000).reshape(-1, 1)
+        # evaluate logp
+        logp = trainer._compute_logp(state, input)
+        # select the top 1000
+        input = jnp.array(input[logp.argsort()[-1000:]])
+
+        # input = trainer._sample(state, config.batch_size)
         # sample from gaussian
         # input = (
         #     jax.random.normal(state.rng_key, (config.batch_size, config.action_dim))
@@ -122,7 +129,8 @@ if __name__ == "__main__":
             gm_loss.append(metrics["elbo"])
             policy_loss.append(metrics["pg_loss"])
 
-            actions = trainer._sample(state, 1000)
+            actions = input
+            # actions = trainer._sample(state, 1000)
             # actions = jax.random.normal(state.rng_key, (1000, config.action_dim))
             print(actions.min(), actions.max())
             viz_helper.clear_output(wait=True)
