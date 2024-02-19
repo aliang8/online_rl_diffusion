@@ -8,3 +8,5 @@ ipdb
 imageio
 moviepy
 ipywidgets
+gymnasium_robotics
+gymnasium
