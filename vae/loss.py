@@ -41,9 +41,9 @@ def policy_loss_fn(
     a_log_probs = dist.log_prob(actions)
 
     # PG = E[log(pi(a|s)) * r(s)]
-    returns = (returns - jnp.mean(returns)) / (jnp.std(returns) + eps)
-    # pg_loss = -a_log_probs * (returns - value_estimate)
-    pg_loss = -a_log_probs * returns
+    # returns = (returns - jnp.mean(returns)) / (jnp.std(returns) + eps)
+    pg_loss = -a_log_probs * (returns - value_estimate)
+    # pg_loss = -a_log_probs * returns
     pg_loss *= dones_mask
     pg_loss = pg_loss.sum()
 
@@ -52,8 +52,8 @@ def policy_loss_fn(
     value_estimate_loss = value_estimate_loss.sum() / dones_mask.sum()
 
     # jax.debug.breakpoint()
-    # total_loss = pg_loss + value_estimate_loss
-    total_loss = pg_loss
+    total_loss = pg_loss + value_estimate_loss
+    # total_loss = pg_loss
 
     # apply L2 regularization on the weights
     l2_reg = sum((1e-3 * optax.l2_loss(w)).mean() for w in jax.tree_leaves(params))

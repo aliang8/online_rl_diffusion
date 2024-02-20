@@ -50,7 +50,8 @@ def create_learning_rate_fn(
 
 class TrainingState(NamedTuple):
     params: hk.Params
-    opt_state: optax.OptState
+    policy_opt_state: optax.OptState
+    vf_opt_state: optax.OptState
     step: int
 
 
@@ -181,11 +182,17 @@ class Trainer:
                 optax.clip_by_global_norm(1.0),
                 optax.adam(config.lr),
             )
-        all_params = (policy_params, value_fn_params)
-        opt_state = optimizer.init(all_params)
+            vf_optimizer = optax.chain(
+                optax.clip_by_global_norm(1.0),
+                optax.adam(config.vf_lr),
+            )
+        policy_opt_state = optimizer.init(policy_params)
+        vf_opt_state = vf_optimizer.init(value_fn_params)
 
         # create training state
-        self.init_state = TrainingState(all_params, opt_state, 0)
+        self.init_state = TrainingState(
+            (policy_params, value_fn_params), policy_opt_state, vf_opt_state, 0
+        )
         self.train_state = self.init_state
         self.optimizer = optimizer
 
@@ -233,10 +240,19 @@ class Trainer:
                 returns,
                 **extra_kwargs,
             )
-            # jax.debug.breakpoint()
-            updates, new_opt_state = optimizer.update(grad, state.opt_state)
-            new_params = optax.apply_updates(state.params, updates)
-            new_state = TrainingState(new_params, new_opt_state, state.step + 1)
+            policy_params, value_fn_params = state.params
+            updates, new_policy_opt_state = optimizer.update(
+                grad[0], state.policy_opt_state
+            )
+            new_policy_params = optax.apply_updates(policy_params, updates)
+            updates, new_vf_opt_state = vf_optimizer.update(grad[1], state.vf_opt_state)
+            new_vf_params = optax.apply_updates(value_fn_params, updates)
+            new_state = TrainingState(
+                (new_policy_params, new_vf_params),
+                new_policy_opt_state,
+                new_vf_opt_state,
+                state.step + 1,
+            )
             return new_state, metrics
 
         self._update_step = update_step
