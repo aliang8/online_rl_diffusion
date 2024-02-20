@@ -21,15 +21,37 @@ import gymnasium as gym
 import ml_collections
 import time
 from loss import policy_loss_fn, vae_policy_loss_fn
+import gymnax
 
 dist = tfp.distributions
 
 eps = jnp.finfo(jnp.float32).eps.item()
 
 
+def create_learning_rate_fn(
+    num_epochs, warmup_epochs, base_learning_rate, steps_per_epoch
+):
+    """Creates learning rate schedule."""
+    warmup_fn = optax.linear_schedule(
+        init_value=0.0,
+        end_value=base_learning_rate,
+        transition_steps=warmup_epochs * steps_per_epoch,
+    )
+    cosine_epochs = max(num_epochs - warmup_epochs, 1)
+    cosine_fn = optax.cosine_decay_schedule(
+        init_value=base_learning_rate, decay_steps=cosine_epochs * steps_per_epoch
+    )
+    schedule_fn = optax.join_schedules(
+        schedules=[warmup_fn, cosine_fn],
+        boundaries=[warmup_epochs * steps_per_epoch],
+    )
+    return schedule_fn
+
+
 class TrainingState(NamedTuple):
     params: hk.Params
     opt_state: optax.OptState
+    step: int
 
 
 class Trainer:
@@ -37,25 +59,29 @@ class Trainer:
         self.rng_seq = hk.PRNGSequence(config.seed)
 
         # params
-        self.env = gym.make(config.env_id)
-        self.env.reset(seed=0)
-        sample_obs = jnp.zeros((1, self.env.observation_space.shape[0]))
+        # self.env = gym.make(config.env_id)
+        # self.env.reset(seed=0)
+        self.env, self.env_params = gymnax.make(config.env_id)
+        self.env.reset(next(self.rng_seq), self.env_params)
+        obs_space = self.env.observation_space(self.env_params)
+        action_space = self.env.action_space(self.env_params)
+        sample_obs = jnp.zeros((1, obs_space.shape[0]))
 
         # if discrete
         config = ml_collections.ConfigDict(config)
-        if isinstance(self.env.action_space, gym.spaces.Discrete):
+        if isinstance(action_space, gymnax.environments.spaces.Discrete):
             self.is_discrete = True
             # unlock frozenconfigdict
-            config.model.decoder.action_dim = int(self.env.action_space.n)
-            config.model.policy.action_dim = int(self.env.action_space.n)
+            config.model.decoder.action_dim = int(action_space.n)
+            config.model.policy.action_dim = int(action_space.n)
             config.model.decoder.is_discrete = True
             sample_action = jnp.zeros((1, 1))
         else:
             self.is_discrete = False
             config.model.decoder.is_discrete = False
-            config.model.decoder.action_dim = int(self.env.action_space.shape[0])
-            config.model.policy.action_dim = int(self.env.action_space.shape[0])
-            sample_action = jnp.zeros((1, self.env.action_space.shape[0]))
+            config.model.decoder.action_dim = int(action_space.shape[0])
+            config.model.policy.action_dim = int(action_space.shape[0])
+            sample_action = jnp.zeros((1, action_space.shape[0]))
 
         @hk.transform
         def vae_policy_forward(obs, action):
@@ -107,9 +133,8 @@ class Trainer:
         @hk.transform
         def sample_policy(obs):
             policy = Policy(**config.model.policy)
-            _, logits, log_prob = policy(obs)
-            action = jnp.argmax(logits, axis=-1)
-            return action
+            action, logits, log_prob = policy(obs)
+            return action, log_prob
 
         @hk.transform
         def value_fn(obs):
@@ -139,15 +164,28 @@ class Trainer:
         print("number of value function params: ", value_fn_param_count)
 
         # optimizer
-        optimizer = optax.chain(
-            optax.clip_by_global_norm(1.0),
-            optax.adam(config.lr),
+        self.lr_fn = create_learning_rate_fn(
+            num_epochs=config.num_epochs,
+            warmup_epochs=100,
+            base_learning_rate=config.lr,
+            steps_per_epoch=1,
         )
+
+        if config.use_lr_scheduler:
+            optimizer = optax.chain(
+                optax.clip_by_global_norm(1.0),
+                optax.adam(self.lr_fn),
+            )
+        else:
+            optimizer = optax.chain(
+                optax.clip_by_global_norm(1.0),
+                optax.adam(config.lr),
+            )
         all_params = (policy_params, value_fn_params)
         opt_state = optimizer.init(all_params)
 
         # create training state
-        self.init_state = TrainingState(all_params, opt_state)
+        self.init_state = TrainingState(all_params, opt_state, 0)
         self.train_state = self.init_state
         self.optimizer = optimizer
 
@@ -158,6 +196,7 @@ class Trainer:
         )
         self.config = config
 
+        # @partial(jax.jit, static_argnames=("entropy_weight"))
         @jax.jit
         def update_step(
             state,
@@ -173,6 +212,15 @@ class Trainer:
             input: batch of points
             returns: new TrainingState
             """
+            if self.config.policy_cls == "vae":
+                extra_kwargs = dict(
+                    prior_loss_weight=config.prior_loss_weight,
+                    kl_weight=config.kl_weight,
+                    is_discrete=self.is_discrete,
+                    entropy_weight=entropy_weight,
+                )
+            else:
+                extra_kwargs = dict()
             (_, metrics), grad = jax.value_and_grad(loss_fn, has_aux=True)(
                 state.params,
                 rng_key,
@@ -183,11 +231,12 @@ class Trainer:
                 rewards,
                 dones,
                 returns,
-                entropy_weight,
+                **extra_kwargs,
             )
+            # jax.debug.breakpoint()
             updates, new_opt_state = optimizer.update(grad, state.opt_state)
             new_params = optax.apply_updates(state.params, updates)
-            new_state = TrainingState(new_params, new_opt_state)
+            new_state = TrainingState(new_params, new_opt_state, state.step + 1)
             return new_state, metrics
 
         self._update_step = update_step
@@ -202,56 +251,60 @@ class Trainer:
         self.init_state = state
         return state
 
-    def collect_rollout(self, train_state):
-        states, actions, rewards = [], [], []
-        obs, info = self.env.reset()
-        done = False
-        t = 0
-        policy_params, _ = train_state.params
-        while not done:
-            rng_key = next(self.rng_seq)
-            action = self._sample_action(policy_params, rng_key, obs)
-            states.append(obs)
-            actions.append(action)
-            obs, reward, done, truncated, info = self.env.step(action.item())
-            rewards.append(reward)
-            t += 1
-            done = done or truncated
+    def collect_rollout(self, train_state, rng_key):
+        """Rollout a jitted gymnax episode with lax.scan."""
+        policy_params, value_fn_params = train_state.params
+        reset_rng, step_rng = jax.random.split(rng_key)
+        # Reset the environment
+        obs, state = self.env.reset(reset_rng, self.env_params)
 
-        R = 0
-        returns = []
-        for r in rewards:
-            R = r + self.config.discount * R
-            returns.insert(0, R)
+        def policy_step(state_input, tmp):
+            """lax.scan compatible step transition in jax env."""
+            obs, state, policy_params, rng = state_input
+            rng_step, rng_sample, rng = jax.random.split(rng, 3)
+            action, _ = self._sample_action(policy_params, rng_sample, obs)
+            next_obs, next_state, reward, done, _ = self.env.step(
+                rng_step, state, action, self.env_params
+            )
+            carry = [next_obs, next_state, policy_params, rng]
+            return carry, [obs, action, reward, next_obs, done]
 
-        returns = jnp.array(returns)
-
-        # normalize returns
-        # actually don't do this, this messes up the training
-        # probably because we're already subtracting baseline?
-        # returns = (returns - returns.mean()) / (returns.std() + eps)
-        return (
-            jnp.array(states),
-            jnp.array(actions),
-            jnp.array(rewards),
-            jnp.array(returns),
+        # Scan over episode step loop
+        _, scan_out = jax.lax.scan(
+            policy_step, [obs, state, policy_params, step_rng], (), 500
         )
+        # Return masked sum of rewards accumulated by agent in episode
+        obs, action, reward, next_obs, done = scan_out
 
-    def run_eval(self, train_state):
-        eval_env = gym.make(self.config.env_id)
-        returns = []
-        policy_params, _ = train_state.params
+        dones_mask = jnp.logical_not(jnp.cumsum(done, axis=0).astype(bool))
+        reward *= dones_mask
 
-        for _ in range(self.config.num_eval_episodes):
-            obs, info = eval_env.reset()
-            done = False
-            total_reward = 0
-            while not done:
-                rng_key = next(self.rng_seq)
-                action = self._sample_action(policy_params, rng_key, obs)
-                obs, reward, done, truncated, _ = eval_env.step(action.item())
-                total_reward += reward
+        # compute returns
+        def scan_fn(prev_return, reward):
+            return reward + 1.0 * prev_return, reward + 1.0 * prev_return
 
-                done = done or truncated
-            returns.append(total_reward)
-        print("Average return: ", jnp.mean(jnp.array(returns)))
+        init_return = jnp.zeros_like(reward[0])
+        _, returns = jax.lax.scan(scan_fn, init_return, reward[::-1])
+        returns = returns[::-1]
+        return obs, action, returns, next_obs, dones_mask
+
+    # def run_eval(self, train_state):
+    #     # eval_env = gym.make(self.config.env_id)
+    #     eval_env, _ = gymnax.make(self.config.env_id)
+    #     returns = []
+    #     policy_params, _ = train_state.params
+
+    #     for _ in range(self.config.num_eval_episodes):
+    #         obs, state = eval_env.reset(next(self.rng_seq), self.env_params)
+    #         done = False
+    #         total_reward = 0
+    #         while not done:
+    #             rng_key = next(self.rng_seq)
+    #             action, _ = self._sample_action(policy_params, rng_key, obs)
+    #             obs, state, reward, done, _ = eval_env.step(
+    #                 next(self.rng_seq), state, action, self.env_params
+    #             )
+    #             total_reward += reward
+
+    #         returns.append(total_reward)
+    #     print("Average return: ", jnp.mean(jnp.array(returns)))

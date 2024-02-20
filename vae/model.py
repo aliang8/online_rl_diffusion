@@ -26,7 +26,7 @@ class Policy(hk.Module):
             ]
         )
         logits = net(x)
-        action = jax.random.categorical(hk.next_rng_key(), logits)
+        action = jax.random.categorical(hk.next_rng_key(), logits=logits)
         log_prob = dist.Categorical(logits=logits).log_prob(action)
         return action, logits, log_prob
 

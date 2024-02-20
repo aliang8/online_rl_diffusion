@@ -9,6 +9,12 @@ import os
 import gymnasium as gym
 import tqdm
 import time
+import collections
+from collections import deque
+import numpy as np
+import gymnax
+from gymnax.visualize import Visualizer
+
 
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.01"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
@@ -27,7 +33,7 @@ def get_config():
     hidden_size = FieldReference(128)
     latent_size = FieldReference(4)
 
-    config.training_steps = FieldReference(10000)
+    config.training_steps = FieldReference(2000)
     config.seed = seed
     config.ckpt_dir = "/scr/aliang80/changepoint_aug/online_rl_diffusion/results"
     config.log_interval = 50
@@ -44,17 +50,20 @@ def get_config():
             seed=seed,
             batch_size=config.batch_size,
             ckpt_dir=config.ckpt_dir,
-            discount=0.99,
+            discount=1.0,
             lr=1e-3,
             kl_weight=1e-2,
             reward_weight=1.0,
+            prior_loss_weight=1.0,
             prior_type="state_conditioned",
             # env_id="Pendulum-v1",
             env_id="CartPole-v1",
             # max_episode_steps=200,
             num_eval_episodes=5,
-            policy_cls="categorical",
+            policy_cls="categorical",  # vae, categorical
             max_episode_steps=1000,
+            num_epochs=config.training_steps,
+            use_lr_scheduler=False,
             train=dict(
                 optimizer=dict(
                     optimizer_type="adam",
@@ -122,46 +131,34 @@ if __name__ == "__main__":
 
     entropy_weight = config.entropy_weight
 
+    scores_deque = deque(maxlen=100)
+    jit_rollout = jax.jit(trainer.collect_rollout)
+    jit_update_step = jax.jit(trainer._update_step)
+
+    gamma = config.experiment_kwargs.discount
+
     for step in tqdm.tqdm(range(config.training_steps)):
-        # create linspace
-        # input = jnp.linspace(-1, 1, 5000).reshape(-1, 1)
-        # # evaluate logp
-        # logp = trainer._compute_logp(state, input)
-        # # select the top 1000
-        # input = jnp.array(input[logp.argsort()[-1000:]])
-
-        # collect a rollout for gradient estimation in REINFORCE
-        # print("collecting rollout")
-        start = time.time()
-        obss, actions, rewards, returns = trainer.collect_rollout(train_state)
-        num_steps = obss.shape[0]
-        # pad to length 500 for cartpole because all of the
-        # rollouts have different lengths
-        obss = jnp.pad(obss, ((0, 500 - obss.shape[0]), (0, 0)))
-        actions = jnp.pad(actions, (0, 500 - actions.shape[0]))
-        rewards = jnp.pad(rewards, (0, 500 - rewards.shape[0]))
-        dones = jnp.array([0] * 500)
-        dones = dones.at[jnp.arange(num_steps)].set(1)
-        returns = jnp.pad(returns, (0, 500 - returns.shape[0]))
-
-        assert obss.shape[0] == 500
-        # end = time.time()
-        # print(f"rollout time: {(end - start)}")
-        # print("done collecting rollout")
-        # input = trainer._sample(state, config.batch_size)
-        # sample from gaussian
-        # input = (
-        #     jax.random.normal(state.rng_key, (config.batch_size, config.action_dim))
-        #     * 0.3
-        # )
-        # input = jnp.zeros((config.batch_size, config.action_dim))
-        # print("updating step")
         rng_key = next(trainer.rng_seq)
-        # start_time = time.time()
-        train_state, metrics = trainer._update_step(
-            train_state, rng_key, obss, actions, rewards, dones, returns, entropy_weight
+        start = time.time()
+        obss, actions, returns, next_obs, dones_mask = jit_rollout(train_state, rng_key)
+        end = time.time()
+        # print("rollout time: ", (end - start))
+
+        scores_deque.append(returns[0].item())
+        rng_key = next(trainer.rng_seq)
+        start_time = time.time()
+        train_state, metrics = jit_update_step(
+            train_state,
+            rng_key,
+            obss,
+            actions,
+            rewards,
+            dones_mask,
+            returns,
+            entropy_weight,
         )
-        # end_time = time.time()
+        lr = trainer.lr_fn(train_state.step)
+        end_time = time.time()
         # print(f"step time: {(end_time - start_time)}")
         # print("done updating step")
         trainer.train_state = train_state
@@ -170,6 +167,7 @@ if __name__ == "__main__":
         # print(state.params["state_conditioned_prior/linear"]["w"].mean())
         # print(state.params["decoder/linear"]["w"].mean())
         # print(state.params["encoder/linear"]["w"].mean())
+        # print(train_state.params[0]["policy/linear"]["w"].mean())
 
         entropy_weight *= config.entropy_decay_rate
 
@@ -185,14 +183,13 @@ if __name__ == "__main__":
             import pprint
 
             pprint.pprint(metrics)
+            print("lr: ", lr)
         if step % config.ckpt_interval == 0:
             trainer.save_checkpoint(train_state, step, config.ckpt_dir)
 
         if step % config.eval_interval == 0:
-            trainer.run_eval(train_state)
-
-        # generate visualization
-        # if step % config.visualize_every == 0:
+            print("average train reward: ", np.mean(scores_deque))
+        # trainer.run_eval(train_state)
         #     rewards.append(metrics["reward"])
         #     gm_loss.append(metrics["elbo"])
         #     policy_loss.append(metrics["pg_loss"])
