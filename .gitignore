@@ -1,0 +1,6 @@
+*.pth
+*.ipynb 
+*.pkl
+__pycache__/*
+MNIST/*
+old/*
