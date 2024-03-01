@@ -4,6 +4,7 @@ from ml_collections import ConfigDict, FieldReference, FrozenConfigDict, config_
 def get_base_config():
     config = ConfigDict()
     config.seed = 0
+    config.ray_experiment_name = "online_rl_diffusion"
     config.root_dir = "/scr/aliang80/online_rl_diffusion"
     config.video_dir = "videos"
     config.batch_size = 128
@@ -17,9 +18,13 @@ def get_base_config():
     config.mode = "train"
     config.vizdom_name = ""
     config.env_name = "MountainCarContinuous-v0"
+    config.smoke_test = True
+    config.save_eval_video = True
+    config.num_eval_video_save = 2
 
     # rl training
     config.policy_lr = 3e-4
     config.critic_lr = 3e-4
     config.gamma = 0.99
+    config.entropy_weight = 0.1
     return config

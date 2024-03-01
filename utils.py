@@ -26,6 +26,7 @@ def create_learning_rate_fn(
     )
     return schedule_fn
 
+
 @chex.dataclass
 class Trajectory:
     states: np.ndarray
@@ -35,12 +36,13 @@ class Trajectory:
     next_states: np.ndarray
     success: bool
 
+
 def make_env(env_name: str, seed: int = 0):
     env = gym.make(env_name, render_mode="rgb_array")
 
     print("observation space:", env.observation_space)
     print("action space:", env.action_space)
-    
-    # first reset to set seed 
+
+    # first reset to set seed
     env.reset(seed=seed)
     return env

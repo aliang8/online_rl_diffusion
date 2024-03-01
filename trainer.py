@@ -28,6 +28,10 @@ import pickle
 from pathlib import Path
 import utils
 from models import policy_fn
+from ray import train, tune
+from ray.train import RunConfig, ScalingConfig
+import cv2
+
 
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.01"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
@@ -57,8 +61,16 @@ class BaseRLTrainer:
         self.xp.train = mlogger.Container()
         self.xp.test = mlogger.Container()
 
+        # setup log dirs
+        self.ckpt_dir = Path(self.config.root_dir) / self.config.results_dir
+        # make it
+        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+        self.video_dir = Path(self.config.root_dir) / self.config.video_dir
+        self.video_dir.mkdir(parents=True, exist_ok=True)
+
         self.loss_keys = [
             ("pg_loss", mlogger.metric.Average, "PG Loss"),
+            ("entropy_loss", mlogger.metric.Average, "Entropy Loss"),
             ("return", mlogger.metric.Average, "Returns"),
             ("success", mlogger.metric.Average, "Success Rate"),
             ("episode_length", mlogger.metric.Average, "Episode Length"),
@@ -118,12 +130,12 @@ class BaseRLTrainer:
         )
         return ts
 
-    def collect_single_rollout(self):
+    def collect_single_rollout(self, train=True):
         # first step
         obs, _ = self.train_env.reset()
 
         # iterate
-        states, actions, rewards, next_states, dones = [], [], [], [], []
+        states, actions, rewards, next_states, dones, frames = [], [], [], [], [], []
 
         success = False
         for step in range(self.config.max_episode_steps):
@@ -147,6 +159,11 @@ class BaseRLTrainer:
             # update state
             obs = next_obs
 
+            # render
+            if not train and self.config.save_eval_video:
+                frame = self.train_env.render()
+                frames.append(frame)
+
             # check if done
             if done:
                 success = True
@@ -160,21 +177,61 @@ class BaseRLTrainer:
             next_states=np.array(next_states),
             success=success,
         )
-        return trajectory
+        frames = np.array(frames)
+        return trajectory, frames
 
-    def run_eval_rollouts(self):
+    def run_eval_rollouts(self, epoch):
         # reset metrics
         for metric in self.xp.test.metrics():
             metric.reset()
 
         for eval_episode_indx in range(self.config.num_eval_episodes):
-            trajectory = self.collect_single_rollout()
+            trajectory, frames = self.collect_single_rollout(train=False)
             metrics = {
                 "return": trajectory.rewards.sum(),
                 "success": np.array(trajectory.success),
                 "episode_length": np.array(len(trajectory.rewards)),
             }
 
+            # save videos
+            if (
+                self.config.save_eval_video
+                and eval_episode_indx < self.config.num_eval_video_save
+            ):
+                # video_file = self.video_dir / f"eval_{eval_episode_indx}.mp4"
+                # print(f"Saving video to: {video_file}")
+                # # save frames
+                # fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                # out = cv2.VideoWriter(
+                #     str(video_file), fourcc, 20.0, (frames.shape[2], frames.shape[1])
+                # )
+                # for frame in frames:
+                #     out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                # out.release()
+                # write some text on the frames
+                y0, dy = 50, 20
+                for timestep, image in enumerate(frames):
+                    text = f"epoch: {epoch} \ntimestep: {timestep} \nreturn: {round(np.sum(trajectory.rewards[:timestep+1]),2)}\nstate: {np.round(trajectory.states[timestep], 2)}\naction: {np.round(trajectory.actions[timestep],2)}\ndone: {trajectory.dones[timestep]}\nsuccess: {trajectory.success}"
+
+                    for i, line in enumerate(text.split("\n")):
+                        y = y0 + i * dy
+                        frames[timestep] = cv2.putText(
+                            frames[timestep],
+                            line,
+                            (25, y),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.3,
+                            (0, 0, 255),
+                            1,
+                            cv2.LINE_AA,
+                        )
+
+                self.plotter.viz.video(
+                    tensor=frames,
+                    env=self.plotter.viz.env,
+                    win=f"eval_video_{eval_episode_indx}_{epoch}",
+                )
+                # self.plotter.viz.matplot(plt, env=self.plotter.viz.env)
             # log metrics
             for lk in metrics.keys():
                 self.xp.test.__getattribute__(lk).update(
@@ -200,9 +257,12 @@ class BaseRLTrainer:
         pg_loss = -a_log_probs * advantage
         pg_loss = pg_loss.sum()
 
-        total_loss = pg_loss
+        # add exploration bonus, want to maximize entropy
+        entropy_loss = self.config.entropy_weight * action_dist.entropy().sum()
 
-        metrics = {"pg_loss": pg_loss}
+        total_loss = pg_loss - entropy_loss
+
+        metrics = {"pg_loss": pg_loss, "entropy_loss": entropy_loss}
 
         return total_loss, metrics
 
@@ -234,7 +294,7 @@ class BaseRLTrainer:
                 metric.reset()
 
             # collect rollout of transitions
-            trajectory = self.collect_single_rollout()
+            trajectory, _ = self.collect_single_rollout()
 
             # compute discounted returns
             returns = self.compute_discounted_returns(trajectory)
@@ -260,15 +320,11 @@ class BaseRLTrainer:
 
             # run evaluate
             if self.config.eval_every and episode_indx % self.config.eval_every == 0:
-                self.run_eval_rollouts()
+                self.run_eval_rollouts(epoch=episode_indx)
 
             # save policy
             if self.config.save_every and episode_indx % self.config.save_every == 0:
-                ckpt_file = (
-                    Path(self.config.root_dir)
-                    / self.config.results_dir
-                    / "policy_params.pkl"
-                )
+                ckpt_file = self.ckpt_dir / "policy_params.pkl"
                 with open(ckpt_file, "wb") as f:
                     pickle.dump(self.ts.params, f)
 
@@ -279,14 +335,50 @@ class BaseRLTrainer:
             self.plotter.update_plots()
 
 
-def main(_):
-    config = _CONFIG.value
+def train_model_fn(config):
+    trial_dir = train.get_context().get_trial_dir()
+    if trial_dir:
+        print("Trial dir: ", trial_dir)
+        config["root_dir"] = Path(trial_dir)
+        base_name = Path(trial_dir).name
+    else:
+        base_name = "base"
+    config["vizdom_name"] = config["ray_experiment_name"] + "_" + base_name
+
+    # wrap config in ConfigDict
+    config = ConfigDict(config)
+
     print(config)
     trainer = BaseRLTrainer(config)
     if config.mode == "train":
         trainer.train()
     elif config.mode == "eval":
         trainer.eval()
+
+
+def main(_):
+    config = _CONFIG.value.to_dict()
+    if config["smoke_test"] is False:
+        # run with ray tune
+        param_space = {
+            "seed": tune.grid_search([0, 1]),
+            "policy_lr": tune.grid_search([3e-4, 1e-3, 1e-4]),
+        }
+        config.update(param_space)
+        train_model = tune.with_resources(train_model_fn, {"cpu": 2, "gpu": 1})
+
+        run_config = RunConfig(
+            name=config["ray_experiment_name"],
+            local_dir="/scr/aliang80/online_rl_diffusion/ray_results",
+            storage_path="/scr/aliang80/online_rl_diffusion/ray_results",
+            log_to_file=True,
+        )
+        tuner = tune.Tuner(train_model, param_space=config, run_config=run_config)
+        results = tuner.fit()
+        print(results)
+    else:
+        # run without ray tune
+        train_model_fn(config)
 
 
 if __name__ == "__main__":
