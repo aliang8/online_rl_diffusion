@@ -5,6 +5,9 @@ import dataclasses
 import jax.numpy as jnp
 import gymnasium as gym
 import numpy as np
+from flax.training.train_state import TrainState
+from typing import Any, Callable
+from flax import core, struct
 
 
 def create_learning_rate_fn(
@@ -33,8 +36,15 @@ class Trajectory:
     actions: np.ndarray
     rewards: np.ndarray
     dones: np.ndarray
+    log_probs: np.ndarray
     next_states: np.ndarray
     success: bool
+
+
+class ActorCriticTrainState(TrainState):
+    value_params: dict
+    value_fn_apply: Callable = struct.field(pytree_node=False)
+    value_fn_opt: optax.GradientTransformation
 
 
 def make_env(env_name: str, seed: int = 0):

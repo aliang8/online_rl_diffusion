@@ -1,10 +1,5 @@
 """
 Train policy with RL algorithm
-
-Usage:
-python3 trainer.py \
-    --config=configs/rl_config.py \
-    --config.mode=train \
 """
 
 from absl import app
@@ -27,17 +22,13 @@ from tensorflow_probability.substrates import jax as tfp
 import pickle
 from pathlib import Path
 import utils
-from models import policy_fn
+from models import policy_fn, value_fn
 from ray import train, tune
 from ray.train import RunConfig, ScalingConfig
 import cv2
+from utils import ActorCriticTrainState
 
-
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.01"
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-
-_CONFIG = config_flags.DEFINE_config_file("config")
-eps = jnp.finfo(jnp.float32).eps.item()
+eps = jnp.finfo(jnp.float32).eps
 
 
 class BaseRLTrainer:
@@ -68,13 +59,14 @@ class BaseRLTrainer:
         self.video_dir = Path(self.config.root_dir) / self.config.video_dir
         self.video_dir.mkdir(parents=True, exist_ok=True)
 
-        self.loss_keys = [
-            ("pg_loss", mlogger.metric.Average, "PG Loss"),
-            ("entropy_loss", mlogger.metric.Average, "Entropy Loss"),
-            ("return", mlogger.metric.Average, "Returns"),
-            ("success", mlogger.metric.Average, "Success Rate"),
-            ("episode_length", mlogger.metric.Average, "Episode Length"),
-        ]
+        if not hasattr(self, "loss_keys"):
+            self.loss_keys = [
+                ("pg_loss", mlogger.metric.Average, "PG Loss"),
+                ("entropy_loss", mlogger.metric.Average, "Entropy Loss"),
+                ("return", mlogger.metric.Average, "Returns"),
+                ("success", mlogger.metric.Average, "Success Rate"),
+                ("episode_length", mlogger.metric.Average, "Episode Length"),
+            ]
         print("loss keys: ", self.loss_keys)
         for lk, logger_cls, title in self.loss_keys:
             self.xp.train.__setattr__(
@@ -117,17 +109,41 @@ class BaseRLTrainer:
         param_count = sum(p.size for p in jax.tree_util.tree_leaves(policy_params))
         print(f"Number of policy parameters: {param_count}")
 
-        policy_fn_apply = partial(
+        policy_fn_apply = jax.tree_util.Partial(
             jax.jit(policy_fn.apply, static_argnums=(3, 4)),
             hidden_size=self.config.hidden_size,
             action_dim=self.action_dim,
         )
 
-        ts = TrainState.create(
-            apply_fn=policy_fn_apply,
-            params=policy_params,
-            tx=policy_opt,
-        )
+        if self.config.baseline:
+            value_fn_apply = jax.tree_util.Partial(
+                jax.jit(hk.without_apply_rng(value_fn).apply, static_argnums=(2)),
+                hidden_size=self.config.hidden_size,
+            )
+            value_params = value_fn.init(
+                rng,
+                sample_obs,
+                hidden_size=self.config.hidden_size,
+            )
+            value_opt = optax.chain(
+                optax.clip_by_global_norm(1.0),
+                optax.adam(self.config.critic_lr),
+            )
+
+            ts = ActorCriticTrainState.create(
+                apply_fn=policy_fn_apply,
+                params=policy_params,
+                tx=policy_opt,
+                value_params=value_params,
+                value_fn_apply=value_fn_apply,
+                value_fn_opt=value_opt,
+            )
+        else:
+            ts = TrainState.create(
+                apply_fn=policy_fn_apply,
+                params=policy_params,
+                tx=policy_opt,
+            )
         return ts
 
     def collect_single_rollout(self, train=True):
@@ -135,12 +151,20 @@ class BaseRLTrainer:
         obs, _ = self.train_env.reset()
 
         # iterate
-        states, actions, rewards, next_states, dones, frames = [], [], [], [], [], []
+        states, actions, rewards, next_states, dones, log_probs, frames = (
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
 
         success = False
         for step in range(self.config.max_episode_steps):
             rng_key = next(self.rng_seq)
-            action, action_dist, log_prob = self.ts.apply_fn(
+            action, action_dist, log_prob, *_ = self.ts.apply_fn(
                 self.ts.params, rng_key, obs
             )
 
@@ -155,6 +179,7 @@ class BaseRLTrainer:
             rewards.append(reward)
             next_states.append(next_obs)
             dones.append(done)
+            log_probs.append(log_prob)
 
             # update state
             obs = next_obs
@@ -169,12 +194,14 @@ class BaseRLTrainer:
                 success = True
                 break
 
+        # jax.debug.breakpoint()
         trajectory = utils.Trajectory(
             states=np.array(states),
             actions=np.array(actions),
             rewards=np.array(rewards),
             dones=np.array(dones),
             next_states=np.array(next_states),
+            log_probs=np.array(log_probs),
             success=success,
         )
         frames = np.array(frames)
@@ -250,10 +277,17 @@ class BaseRLTrainer:
         # compute action log probabilities
         a_log_probs = action_dist.log_prob(trajectory.actions).squeeze(axis=-1)
 
+        # jax.debug.breakpoint()
+
         # apply whitening to returns
         returns = (returns - jnp.mean(returns)) / (jnp.std(returns) + eps)
-        # advantage = jax.lax.stop_gradient(returns - value_estimate)
-        advantage = returns
+
+        if self.config.baseline:
+            value_estimate = ts.value_fn_apply(ts.value_params, trajectory.states)
+            advantage = returns - value_estimate
+        else:
+            advantage = returns
+
         pg_loss = -a_log_probs * advantage
         pg_loss = pg_loss.sum()
 
@@ -266,11 +300,31 @@ class BaseRLTrainer:
 
         return total_loss, metrics
 
+    def value_loss_fn(self, value_params, ts, trajectory, returns):
+        # compute value loss
+        value_estimate = ts.value_fn_apply(value_params, trajectory.states)
+        value_loss = jnp.mean((value_estimate - returns) ** 2)
+        metrics = {"value_loss": value_loss}
+        return value_loss, metrics
+
     def update_step(self, ts, trajectory, returns, rng_key):
         (policy_loss, metrics), grads = jax.value_and_grad(
             self.policy_loss_fn, has_aux=True
         )(ts.params, ts, rng_key, trajectory, returns)
         ts = ts.apply_gradients(grads=grads)
+
+        if self.config.baseline:
+            (value_loss, value_metrics), value_grads = jax.value_and_grad(
+                self.value_loss_fn, has_aux=True
+            )(ts.value_params, ts, trajectory, returns)
+            updates, value_opt_state = ts.value_fn_opt.update(
+                value_grads, ts.value_opt_state
+            )
+            new_value_params = optax.apply_updates(ts.value_params, updates)
+            ts = ts.replace(
+                value_params=new_value_params, value_opt_state=value_opt_state
+            )
+            metrics.update(value_metrics)
         return ts, policy_loss, metrics
 
     def compute_discounted_returns(self, trajectory):
@@ -333,53 +387,3 @@ class BaseRLTrainer:
 
             # update plots
             self.plotter.update_plots()
-
-
-def train_model_fn(config):
-    trial_dir = train.get_context().get_trial_dir()
-    if trial_dir:
-        print("Trial dir: ", trial_dir)
-        config["root_dir"] = Path(trial_dir)
-        base_name = Path(trial_dir).name
-    else:
-        base_name = "base"
-    config["vizdom_name"] = config["ray_experiment_name"] + "_" + base_name
-
-    # wrap config in ConfigDict
-    config = ConfigDict(config)
-
-    print(config)
-    trainer = BaseRLTrainer(config)
-    if config.mode == "train":
-        trainer.train()
-    elif config.mode == "eval":
-        trainer.eval()
-
-
-def main(_):
-    config = _CONFIG.value.to_dict()
-    if config["smoke_test"] is False:
-        # run with ray tune
-        param_space = {
-            "seed": tune.grid_search([0, 1]),
-            "policy_lr": tune.grid_search([3e-4, 1e-3, 1e-4]),
-        }
-        config.update(param_space)
-        train_model = tune.with_resources(train_model_fn, {"cpu": 2, "gpu": 1})
-
-        run_config = RunConfig(
-            name=config["ray_experiment_name"],
-            local_dir="/scr/aliang80/online_rl_diffusion/ray_results",
-            storage_path="/scr/aliang80/online_rl_diffusion/ray_results",
-            log_to_file=True,
-        )
-        tuner = tune.Tuner(train_model, param_space=config, run_config=run_config)
-        results = tuner.fit()
-        print(results)
-    else:
-        # run without ray tune
-        train_model_fn(config)
-
-
-if __name__ == "__main__":
-    app.run(main)
