@@ -1,1 +1,1 @@
-# online_rl_diffusion
+# Online RL with Diffusion Policy

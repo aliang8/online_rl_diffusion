@@ -36,15 +36,8 @@ class Trajectory:
     actions: np.ndarray
     rewards: np.ndarray
     dones: np.ndarray
-    log_probs: np.ndarray
     next_states: np.ndarray
     success: bool
-
-
-class ActorCriticTrainState(TrainState):
-    value_params: dict
-    value_fn_apply: Callable = struct.field(pytree_node=False)
-    value_fn_opt: optax.GradientTransformation
 
 
 def make_env(env_name: str, seed: int = 0):

@@ -1,0 +1,7 @@
+python3 main.py \
+    --config=configs/base_config.py \
+    --config.entropy_weight=0.01 \
+    --config.share_backbone=True \
+    --config.baseline=True \
+    --config.smoke_test=True \
+    --config.use_wb=True

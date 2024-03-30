@@ -4,3 +4,8 @@
 __pycache__/*
 MNIST/*
 old/*
+*.pyc
+ray_results/*
+videos/*
+configs/__pycache__/*
+wandb/*

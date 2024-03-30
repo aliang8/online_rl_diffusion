@@ -2,7 +2,7 @@
 Train policy with RL algorithm
 """
 
-from absl import app
+from absl import app, logging
 import jax
 import optax
 import jax.numpy as jnp
@@ -22,11 +22,16 @@ from tensorflow_probability.substrates import jax as tfp
 import pickle
 from pathlib import Path
 import utils
-from models import policy_fn, value_fn
+from models import policy_fn, value_fn, actor_critic_fn
 from ray import train, tune
 from ray.train import RunConfig, ScalingConfig
 import cv2
-from utils import ActorCriticTrainState
+import torch
+import wandb
+import equinox as eqx
+from flax import traverse_util
+import gymnasium as gym
+from collections import defaultdict as dd
 
 eps = jnp.finfo(jnp.float32).eps
 
@@ -36,114 +41,99 @@ class BaseRLTrainer:
         self.config = config
         self.rng_seq = hk.PRNGSequence(config.seed)
 
-        # logger
-        self.plotter = mlogger.VisdomPlotter(
-            {
-                "env": self.config.vizdom_name,
-                "server": "http://localhost",
-                "port": 8097,
-            },
-            manual_update=True,
-        )
+        # set torch seed to maintain reproducibility
+        np.random.seed(config.seed)
+        torch.manual_seed(config.seed)
 
-        self.xp = mlogger.Container()
-        self.xp.config = mlogger.Config(plotter=self.plotter)
-        self.xp.config.update(**self.config)
-        self.xp.train = mlogger.Container()
-        self.xp.test = mlogger.Container()
+        if self.config.use_wb:
+            self.wandb_run = wandb.init(
+                # set the wandb project where this run will be logged
+                entity="glamor",
+                project="online_rl_diffusion",
+                name=config.exp_name,
+                notes=self.config.notes,
+                tags=self.config.tags,
+                group=config.group_name if config.group_name else None,
+                # track hyperparameters and run metadata
+                config=self.config,
+            )
+        else:
+            self.wandb_run = None
 
         # setup log dirs
-        self.ckpt_dir = Path(self.config.root_dir) / self.config.results_dir
+        self.root_dir = Path(self.config.root_dir)
+        self.ckpt_dir = self.root_dir / self.config.ckpt_dir
+        logging.info(f"ckpt_dir: {self.ckpt_dir}")
+
         # make it
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
-        self.video_dir = Path(self.config.root_dir) / self.config.video_dir
+        self.video_dir = self.root_dir / self.config.video_dir
         self.video_dir.mkdir(parents=True, exist_ok=True)
 
-        if not hasattr(self, "loss_keys"):
-            self.loss_keys = [
-                ("pg_loss", mlogger.metric.Average, "PG Loss"),
-                ("entropy_loss", mlogger.metric.Average, "Entropy Loss"),
-                ("return", mlogger.metric.Average, "Returns"),
-                ("success", mlogger.metric.Average, "Success Rate"),
-                ("episode_length", mlogger.metric.Average, "Episode Length"),
-            ]
-        print("loss keys: ", self.loss_keys)
-        for lk, logger_cls, title in self.loss_keys:
-            self.xp.train.__setattr__(
-                lk,
-                logger_cls(plotter=self.plotter, plot_title=title, plot_legend="train"),
-            )
-            self.xp.test.__setattr__(
-                lk,
-                logger_cls(plotter=self.plotter, plot_title=title, plot_legend="test"),
-            )
+        self.log_dir = self.root_dir / "logs"
+        self.log_dir.mkdir(parents=True, exist_ok=True)
 
         self.jit_update_step = jax.jit(self.update_step)
 
         # create environment
-        self.train_env = utils.make_env(self.config.env_name, seed=self.config.seed)
+        self.train_env = utils.make_env(self.config.env_id, seed=self.config.seed)
         self.obs_dim = self.train_env.observation_space.shape[0]
-        self.action_dim = self.train_env.action_space.shape[0]
+        self.is_continuous = isinstance(self.train_env.action_space, gym.spaces.Box)
+
+        if self.is_continuous:
+            self.action_dim = self.train_env.action_space.shape[0]
+        else:
+            self.action_dim = self.train_env.action_space.n
+
+        print(f"max episode steps: {self.train_env.spec.max_episode_steps}")
+        print(f"continuous action space: {self.is_continuous}")
 
         # create test environment
-        self.test_env = utils.make_env(
-            self.config.env_name, seed=self.config.seed + 100
-        )
+        self.test_env = utils.make_env(self.config.env_id, seed=self.config.seed + 100)
 
         self.ts = self.create_ts(next(self.rng_seq))
 
     def create_ts(self, rng):
         sample_obs = jnp.zeros((1, self.obs_dim))
-        policy_params = policy_fn.init(
+        ac_params = actor_critic_fn.init(
             rng,
             sample_obs,
             hidden_size=self.config.hidden_size,
             action_dim=self.action_dim,
+            share_backbone=self.config.share_backbone,
+            is_continuous=self.is_continuous,
+            policy_cls=self.config.policy,
+            latent_dim=self.config.latent_dim,
         )
 
-        policy_opt = optax.chain(
-            optax.clip_by_global_norm(1.0),
-            optax.adam(self.config.policy_lr),
+        partition_optimizers = {
+            "policy": optax.adam(self.config.policy_lr),
+            "value": optax.adam(self.config.critic_lr),
+        }
+        param_partitions = traverse_util.path_aware_map(
+            lambda path, v: "value" if "value" in path[0] else "policy", ac_params
         )
 
-        param_count = sum(p.size for p in jax.tree_util.tree_leaves(policy_params))
+        ac_opt = optax.multi_transform(partition_optimizers, param_partitions)
+
+        param_count = sum(p.size for p in jax.tree_util.tree_leaves(ac_params))
         print(f"Number of policy parameters: {param_count}")
 
-        policy_fn_apply = jax.tree_util.Partial(
-            jax.jit(policy_fn.apply, static_argnums=(3, 4)),
+        ac_fn_apply = jax.tree_util.Partial(
+            jax.jit(actor_critic_fn.apply, static_argnums=(3, 4, 5, 6, 7, 8)),
             hidden_size=self.config.hidden_size,
             action_dim=self.action_dim,
+            share_backbone=self.config.share_backbone,
+            is_continuous=self.is_continuous,
+            policy_cls=self.config.policy,
+            latent_dim=self.config.latent_dim,
         )
 
-        if self.config.baseline:
-            value_fn_apply = jax.tree_util.Partial(
-                jax.jit(hk.without_apply_rng(value_fn).apply, static_argnums=(2)),
-                hidden_size=self.config.hidden_size,
-            )
-            value_params = value_fn.init(
-                rng,
-                sample_obs,
-                hidden_size=self.config.hidden_size,
-            )
-            value_opt = optax.chain(
-                optax.clip_by_global_norm(1.0),
-                optax.adam(self.config.critic_lr),
-            )
-
-            ts = ActorCriticTrainState.create(
-                apply_fn=policy_fn_apply,
-                params=policy_params,
-                tx=policy_opt,
-                value_params=value_params,
-                value_fn_apply=value_fn_apply,
-                value_fn_opt=value_opt,
-            )
-        else:
-            ts = TrainState.create(
-                apply_fn=policy_fn_apply,
-                params=policy_params,
-                tx=policy_opt,
-            )
+        ts = TrainState.create(
+            apply_fn=ac_fn_apply,
+            params=ac_params,
+            tx=ac_opt,
+        )
         return ts
 
     def collect_single_rollout(self, train=True):
@@ -151,8 +141,7 @@ class BaseRLTrainer:
         obs, _ = self.train_env.reset()
 
         # iterate
-        states, actions, rewards, next_states, dones, log_probs, frames = (
-            [],
+        states, actions, rewards, next_states, dones, frames = (
             [],
             [],
             [],
@@ -162,11 +151,14 @@ class BaseRLTrainer:
         )
 
         success = False
-        for step in range(self.config.max_episode_steps):
-            rng_key = next(self.rng_seq)
-            action, action_dist, log_prob, *_ = self.ts.apply_fn(
-                self.ts.params, rng_key, obs
-            )
+        done = False
+
+        while not done:
+            action_output, _ = self.ts.apply_fn(self.ts.params, next(self.rng_seq), obs)
+            action = action_output.action
+
+            if self.is_continuous:
+                action *= self.config.action_scale
 
             # this is slow, need to convert to numpy
             next_obs, reward, done, truncated, info = self.train_env.step(
@@ -179,7 +171,6 @@ class BaseRLTrainer:
             rewards.append(reward)
             next_states.append(next_obs)
             dones.append(done)
-            log_probs.append(log_prob)
 
             # update state
             obs = next_obs
@@ -194,6 +185,8 @@ class BaseRLTrainer:
                 success = True
                 break
 
+            done = done or truncated
+
         # jax.debug.breakpoint()
         trajectory = utils.Trajectory(
             states=np.array(states),
@@ -201,40 +194,33 @@ class BaseRLTrainer:
             rewards=np.array(rewards),
             dones=np.array(dones),
             next_states=np.array(next_states),
-            log_probs=np.array(log_probs),
             success=success,
         )
         frames = np.array(frames)
         return trajectory, frames
 
     def run_eval_rollouts(self, epoch):
-        # reset metrics
-        for metric in self.xp.test.metrics():
-            metric.reset()
+        rollout_metrics = dd(list)
+        all_frames = []
 
+        total_rollout_time = 0
         for eval_episode_indx in range(self.config.num_eval_episodes):
             trajectory, frames = self.collect_single_rollout(train=False)
+
             metrics = {
                 "return": trajectory.rewards.sum(),
                 "success": np.array(trajectory.success),
                 "episode_length": np.array(len(trajectory.rewards)),
             }
 
+            for k, v in metrics.items():
+                rollout_metrics[k].append(v)
+
             # save videos
             if (
                 self.config.save_eval_video
                 and eval_episode_indx < self.config.num_eval_video_save
             ):
-                # video_file = self.video_dir / f"eval_{eval_episode_indx}.mp4"
-                # print(f"Saving video to: {video_file}")
-                # # save frames
-                # fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                # out = cv2.VideoWriter(
-                #     str(video_file), fourcc, 20.0, (frames.shape[2], frames.shape[1])
-                # )
-                # for frame in frames:
-                #     out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-                # out.release()
                 # write some text on the frames
                 y0, dy = 50, 20
                 for timestep, image in enumerate(frames):
@@ -253,85 +239,77 @@ class BaseRLTrainer:
                             cv2.LINE_AA,
                         )
 
-                self.plotter.viz.video(
-                    tensor=frames,
-                    env=self.plotter.viz.env,
-                    win=f"eval_video_{eval_episode_indx}_{epoch}",
-                )
-                # self.plotter.viz.matplot(plt, env=self.plotter.viz.env)
-            # log metrics
-            for lk in metrics.keys():
-                self.xp.test.__getattribute__(lk).update(
-                    metrics[lk].item(), weighting=self.config.num_eval_episodes
-                )
+                all_frames.append(frames)
 
-        for metric in self.xp.test.metrics():
-            metric.log()
+        # save video
+        if self.config.save_eval_video and self.wandb_run is not None:
+            # N x T x H x W x C
+            all_frames = np.array(all_frames)
+            all_frames = all_frames[:5]
 
-        return
+            # make N x T x C x H x W
+            all_frames = np.transpose(all_frames, (0, 1, 4, 2, 3))
+            self.wandb_run.log(
+                {f"rollout": wandb.Video(all_frames, fps=30, format="mp4")}
+            )
+            self.wandb_run.log(
+                {
+                    "time/rollout_time": total_rollout_time,
+                    "time/avg_rollout_time": total_rollout_time
+                    / self.config.num_eval_episodes,
+                }
+            )
+
+        rollout_metrics = {k: np.mean(v) for k, v in rollout_metrics.items()}
+        return rollout_metrics
 
     def policy_loss_fn(self, params, ts, rng_key, trajectory, returns):
         # compute reinforce loss
-        _, action_dist, _ = ts.apply_fn(params, rng_key, trajectory.states)
+        _, action_dist, value_estimate = ts.apply_fn(params, rng_key, trajectory.states)
 
         # compute action log probabilities
-        a_log_probs = action_dist.log_prob(trajectory.actions).squeeze(axis=-1)
+        a_log_probs = action_dist.log_prob(trajectory.actions).squeeze()
 
         # jax.debug.breakpoint()
 
-        # apply whitening to returns
-        returns = (returns - jnp.mean(returns)) / (jnp.std(returns) + eps)
-
         if self.config.baseline:
-            value_estimate = ts.value_fn_apply(ts.value_params, trajectory.states)
             advantage = returns - value_estimate
         else:
+            # apply whitening to returns
+            returns = (returns - jnp.mean(returns)) / (jnp.std(returns) + eps)
             advantage = returns
 
         pg_loss = -a_log_probs * advantage
+
+        # jax.debug.breakpoint()
+
         pg_loss = pg_loss.sum()
 
         # add exploration bonus, want to maximize entropy
         entropy_loss = self.config.entropy_weight * action_dist.entropy().sum()
 
         total_loss = pg_loss - entropy_loss
-
         metrics = {"pg_loss": pg_loss, "entropy_loss": entropy_loss}
 
-        return total_loss, metrics
+        if self.config.baseline:
+            # compute value loss
+            value_loss = jnp.mean((value_estimate - returns) ** 2)
+            total_loss += self.config.value_coeff * value_loss
+            metrics["value_loss"] = value_loss
 
-    def value_loss_fn(self, value_params, ts, trajectory, returns):
-        # compute value loss
-        value_estimate = ts.value_fn_apply(value_params, trajectory.states)
-        value_loss = jnp.mean((value_estimate - returns) ** 2)
-        metrics = {"value_loss": value_loss}
-        return value_loss, metrics
+        return total_loss, metrics
 
     def update_step(self, ts, trajectory, returns, rng_key):
         (policy_loss, metrics), grads = jax.value_and_grad(
             self.policy_loss_fn, has_aux=True
         )(ts.params, ts, rng_key, trajectory, returns)
         ts = ts.apply_gradients(grads=grads)
-
-        if self.config.baseline:
-            (value_loss, value_metrics), value_grads = jax.value_and_grad(
-                self.value_loss_fn, has_aux=True
-            )(ts.value_params, ts, trajectory, returns)
-            updates, value_opt_state = ts.value_fn_opt.update(
-                value_grads, ts.value_opt_state
-            )
-            new_value_params = optax.apply_updates(ts.value_params, updates)
-            ts = ts.replace(
-                value_params=new_value_params, value_opt_state=value_opt_state
-            )
-            metrics.update(value_metrics)
         return ts, policy_loss, metrics
 
     def compute_discounted_returns(self, trajectory):
         # compute discounted returns
         rewards = trajectory.rewards
         dones = trajectory.dones
-
         returns = np.zeros_like(rewards)
         R = 0
         for t in reversed(range(len(rewards))):
@@ -344,46 +322,42 @@ class BaseRLTrainer:
 
         # Iterate over number of episodes
         for episode_indx in tqdm.tqdm(range(self.config.num_training_episodes)):
-            for metric in self.xp.train.metrics():
-                metric.reset()
-
             # collect rollout of transitions
+            rollout_time = time.time()
             trajectory, _ = self.collect_single_rollout()
+            rollout_time = time.time() - rollout_time
 
             # compute discounted returns
             returns = self.compute_discounted_returns(trajectory)
 
             # update policy
-            self.ts, loss, metrics = self.jit_update_step(
+            self.ts, loss, train_metrics = self.jit_update_step(
                 self.ts, trajectory, returns, next(self.rng_seq)
             )
 
-            metrics.update(
+            train_metrics.update(
                 {
                     "return": trajectory.rewards.sum(),
                     "success": np.array(trajectory.success).astype(float),
                     "episode_length": np.array(len(trajectory.rewards)),
+                    "rollout_time": rollout_time,
                 }
             )
 
-            # log metrics
-            for lk in metrics.keys():
-                self.xp.train.__getattribute__(lk).update(
-                    metrics[lk].item(), weighting=1
-                )
+            if self.wandb_run is not None:
+                train_metrics = {f"train/{k}": v for k, v in train_metrics.items()}
+                self.wandb_run.log(train_metrics)
 
             # run evaluate
             if self.config.eval_every and episode_indx % self.config.eval_every == 0:
-                self.run_eval_rollouts(epoch=episode_indx)
+                eval_metrics = self.run_eval_rollouts(epoch=episode_indx)
+
+                if self.wandb_run is not None:
+                    eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
+                    self.wandb_run.log(eval_metrics)
 
             # save policy
             if self.config.save_every and episode_indx % self.config.save_every == 0:
-                ckpt_file = self.ckpt_dir / "policy_params.pkl"
+                ckpt_file = self.ckpt_dir / f"policy_{episode_indx}.pkl"
                 with open(ckpt_file, "wb") as f:
                     pickle.dump(self.ts.params, f)
-
-            for metric in self.xp.train.metrics():
-                metric.log()
-
-            # update plots
-            self.plotter.update_plots()
