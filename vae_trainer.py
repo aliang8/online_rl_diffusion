@@ -7,7 +7,7 @@ python3 trainer.py \
     --config.mode=train \
 """
 
-from absl import app
+from absl import app, logging
 import jax
 import optax
 import jax.numpy as jnp
@@ -41,7 +41,9 @@ class VAERLTrainer(BaseRLTrainer):
     def __init__(self, config: FrozenConfigDict):
         super().__init__(config)
 
-    def policy_loss_fn(self, params, ts, rng_key, trajectory, returns):
+    def policy_loss_fn(self, params, ts, rng_key, trajectory):
+        logging.info("inside policy loss")
+
         # compute reinforce loss
         action_output, value_estimate = ts.apply_fn(params, rng_key, trajectory.states)
         action_dist = action_output.action_dist
@@ -63,30 +65,52 @@ class VAERLTrainer(BaseRLTrainer):
         logp_a_s = logp_a_z_s - kl_div
 
         # apply whitening to returns
+        returns = trajectory.returns
         if self.config.baseline:
             advantage = returns - value_estimate
         else:
-            returns = (returns - jnp.mean(returns)) / (jnp.std(returns) + eps)
-            # advantage = jax.lax.stop_gradient(returns - value_estimate)
+            returns = trajectory.returns
+            # take mean of masked returns
+            returns_mean = jnp.mean(returns, where=trajectory.mask)
+            returns_std = jnp.std(returns, where=trajectory.mask)
+            # apply whitening to returns
+            returns = (returns - returns_mean) / (returns_std + eps)
             advantage = returns
 
         pg_loss = -logp_a_s * advantage
+        pg_loss *= trajectory.mask
         pg_loss = pg_loss.sum()
 
         # add exploration bonus, want to maximize entropy
-        entropy_loss = self.config.entropy_weight * action_dist.entropy().sum()
+        entropy = action_dist.entropy()
+        entropy *= trajectory.mask
+        entropy_loss = self.config.entropy_weight * entropy.sum()
 
         total_loss = pg_loss - entropy_loss
 
+        # compute prior loss
+        # KL(p(z|s), q(z|s))
+        prior_dist = action_output.prior_dist
+        prior_kl_div = dist.kl_divergence(prior_dist, latent_dist)
+        prior_kl_div = prior_kl_div.sum(axis=-1)
+        prior_kl_div *= trajectory.mask
+        prior_kl_div = prior_kl_div.sum()
+        total_loss += self.config.prior_kl_weight * prior_kl_div
+
         metrics = {
+            "entropy": jnp.mean(entropy, where=trajectory.mask),
             "entropy_loss": entropy_loss,
             "kl_div": kl_div.mean(),
             "elbo": logp_a_s.mean(),
+            "prior_loss": prior_kl_div,
+            "action_log_prob": logp_a_z_s.mean(),
         }
 
         if self.config.baseline:
             # compute value loss
-            value_loss = jnp.mean((value_estimate - returns) ** 2)
+            value_loss = (value_estimate - returns) ** 2
+            value_loss *= trajectory.mask
+            value_loss = value_loss.mean()
             total_loss += self.config.value_coeff * value_loss
             metrics["value_loss"] = value_loss
 

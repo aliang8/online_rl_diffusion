@@ -38,6 +38,8 @@ class Trajectory:
     dones: np.ndarray
     next_states: np.ndarray
     success: bool
+    returns: np.ndarray
+    mask: np.ndarray
 
 
 def make_env(env_name: str, seed: int = 0):

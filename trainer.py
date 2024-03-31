@@ -120,7 +120,7 @@ class BaseRLTrainer:
         print(f"Number of policy parameters: {param_count}")
 
         ac_fn_apply = jax.tree_util.Partial(
-            jax.jit(actor_critic_fn.apply, static_argnums=(3, 4, 5, 6, 7, 8)),
+            jax.jit(actor_critic_fn.apply, static_argnums=(3, 4, 5, 6, 7, 8, 9)),
             hidden_size=self.config.hidden_size,
             action_dim=self.action_dim,
             share_backbone=self.config.share_backbone,
@@ -128,6 +128,17 @@ class BaseRLTrainer:
             policy_cls=self.config.policy,
             latent_dim=self.config.latent_dim,
         )
+
+        # self.eval_ac_fn_apply = jax.tree_util.Partial(
+        #     jax.jit(actor_critic_fn.apply, static_argnums=(3, 4, 5, 6, 7, 8, 9)),
+        #     hidden_size=self.config.hidden_size,
+        #     action_dim=self.action_dim,
+        #     share_backbone=self.config.share_backbone,
+        #     is_continuous=self.is_continuous,
+        #     policy_cls=self.config.policy,
+        #     latent_dim=self.config.latent_dim,
+        #     sample_prior=True,
+        # )
 
         ts = TrainState.create(
             apply_fn=ac_fn_apply,
@@ -188,6 +199,8 @@ class BaseRLTrainer:
             done = done or truncated
 
         # jax.debug.breakpoint()
+        mask = np.ones_like(np.array(rewards))
+
         trajectory = utils.Trajectory(
             states=np.array(states),
             actions=np.array(actions),
@@ -195,8 +208,29 @@ class BaseRLTrainer:
             dones=np.array(dones),
             next_states=np.array(next_states),
             success=success,
+            returns=None,
+            mask=mask,
         )
         frames = np.array(frames)
+        # compute discounted returns
+        trajectory.returns = self.compute_discounted_returns(trajectory)
+
+        # pad the first dimension to max_episode_steps
+        if len(trajectory.rewards) < self.train_env.spec.max_episode_steps:
+            for k, v in trajectory.__dict__.items():
+                if isinstance(v, np.ndarray):
+                    pad_length = self.train_env.spec.max_episode_steps - v.shape[0]
+                    if len(v.shape) == 1:
+                        v = np.pad(v, ((0, pad_length)))
+                    else:
+                        v = np.pad(v, ((0, pad_length), (0, 0)))
+
+                    setattr(trajectory, k, v)
+
+        # for k, v in trajectory.items():
+        #     if isinstance(v, np.ndarray):
+        #         print(k, v.shape)
+
         return trajectory, frames
 
     def run_eval_rollouts(self, epoch):
@@ -210,7 +244,7 @@ class BaseRLTrainer:
             metrics = {
                 "return": trajectory.rewards.sum(),
                 "success": np.array(trajectory.success),
-                "episode_length": np.array(len(trajectory.rewards)),
+                "episode_length": np.array(sum(trajectory.mask)),
             }
 
             for k, v in metrics.items():
@@ -263,9 +297,12 @@ class BaseRLTrainer:
         rollout_metrics = {k: np.mean(v) for k, v in rollout_metrics.items()}
         return rollout_metrics
 
-    def policy_loss_fn(self, params, ts, rng_key, trajectory, returns):
+    def policy_loss_fn(self, params, ts, rng_key, trajectory):
+        logging.info("inside policy loss")
+
         # compute reinforce loss
-        _, action_dist, value_estimate = ts.apply_fn(params, rng_key, trajectory.states)
+        action_output, value_estimate = ts.apply_fn(params, rng_key, trajectory.states)
+        action_dist = action_output.action_dist
 
         # compute action log probabilities
         a_log_probs = action_dist.log_prob(trajectory.actions).squeeze()
@@ -273,13 +310,18 @@ class BaseRLTrainer:
         # jax.debug.breakpoint()
 
         if self.config.baseline:
-            advantage = returns - value_estimate
+            advantage = trajectory.returns - value_estimate
         else:
+            returns = trajectory.returns
+            # take mean of masked returns
+            returns_mean = jnp.mean(returns, where=trajectory.mask)
+            returns_std = jnp.std(returns, where=trajectory.mask)
             # apply whitening to returns
-            returns = (returns - jnp.mean(returns)) / (jnp.std(returns) + eps)
+            returns = (returns - returns_mean) / (returns_std + eps)
             advantage = returns
 
         pg_loss = -a_log_probs * advantage
+        pg_loss *= trajectory.mask
 
         # jax.debug.breakpoint()
 
@@ -293,16 +335,18 @@ class BaseRLTrainer:
 
         if self.config.baseline:
             # compute value loss
-            value_loss = jnp.mean((value_estimate - returns) ** 2)
+            value_loss = (value_estimate - returns) ** 2
+            value_loss *= trajectory.mask
+            value_loss = value_loss.sum()
             total_loss += self.config.value_coeff * value_loss
             metrics["value_loss"] = value_loss
 
         return total_loss, metrics
 
-    def update_step(self, ts, trajectory, returns, rng_key):
+    def update_step(self, ts, trajectory, rng_key):
         (policy_loss, metrics), grads = jax.value_and_grad(
-            self.policy_loss_fn, has_aux=True
-        )(ts.params, ts, rng_key, trajectory, returns)
+            jax.jit(self.policy_loss_fn), has_aux=True
+        )(ts.params, ts, rng_key, trajectory)
         ts = ts.apply_gradients(grads=grads)
         return ts, policy_loss, metrics
 
@@ -327,19 +371,16 @@ class BaseRLTrainer:
             trajectory, _ = self.collect_single_rollout()
             rollout_time = time.time() - rollout_time
 
-            # compute discounted returns
-            returns = self.compute_discounted_returns(trajectory)
-
             # update policy
             self.ts, loss, train_metrics = self.jit_update_step(
-                self.ts, trajectory, returns, next(self.rng_seq)
+                self.ts, trajectory, next(self.rng_seq)
             )
 
             train_metrics.update(
                 {
                     "return": trajectory.rewards.sum(),
                     "success": np.array(trajectory.success).astype(float),
-                    "episode_length": np.array(len(trajectory.rewards)),
+                    "episode_length": np.array(sum(trajectory.mask)),
                     "rollout_time": rollout_time,
                 }
             )

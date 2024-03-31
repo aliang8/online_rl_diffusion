@@ -21,6 +21,7 @@ class VAEActionOutput:
     action: jnp.ndarray
     action_dist: dist.Normal
     latent_dist: dist.Normal
+    prior_dist: dist.Normal
 
 
 @dataclasses.dataclass
@@ -76,6 +77,8 @@ class Policy(hk.Module):
             logvar = jnp.clip(logvar, -20, 2)
             std = jnp.exp(logvar) ** 0.5
             action_dist = dist.Normal(loc=mean, scale=std)
+            # apply tanh to action
+            action = jnp.tanh(action)
         else:
             logits = hk.Linear(self.action_dim)(x)
             action_dist = dist.Categorical(logits=logits)
@@ -83,8 +86,6 @@ class Policy(hk.Module):
         # sample action from normal distribution
         action = action_dist.sample(seed=hk.next_rng_key())
 
-        # apply tanh to action
-        action = jnp.tanh(action)
         return ActionOutput(action=action, action_dist=action_dist)
 
 
@@ -96,15 +97,23 @@ class ActorCritic(hk.Module):
         is_continuous: bool,
         policy_cls: str,
         latent_dim: int = 8,
+        sample_prior: bool = False,
     ):
         super().__init__()
         self.action_dim = action_dim
         self.hidden_size = hidden_size
+        self.sample_prior = sample_prior
 
         if policy_cls == "gaussian":
             self.actor = Policy(hidden_size, action_dim, is_continuous)
         else:
-            self.actor = VAEPolicy(hidden_size, action_dim, latent_dim, is_continuous)
+            self.actor = VAEPolicy(
+                hidden_size,
+                action_dim,
+                latent_dim,
+                is_continuous,
+                sample_prior=sample_prior,
+            )
 
         self.critic = ValueFunction(hidden_size)
 
@@ -169,6 +178,30 @@ class SharedActorCritic(hk.Module):
         return action_output, value
 
 
+class StateConditionedPrior(hk.Module):
+    def __init__(self, latent_dim: int, hidden_size: int):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.hidden_size = hidden_size
+
+        # p(z | s) <- state conditioned prior
+        self.prior = hk.Sequential(
+            [
+                hk.Linear(self.hidden_size),
+                jax.nn.leaky_relu,
+                hk.Linear(self.hidden_size),
+                jax.nn.leaky_relu,
+            ]
+        )
+
+    def __call__(self, state: jnp.ndarray) -> jnp.ndarray:
+        prior_embed = self.prior(state)
+        mean = hk.Linear(self.latent_dim)(prior_embed)
+        logvar = hk.Linear(self.latent_dim)(prior_embed)
+        logvar = jnp.clip(logvar, -20, 2)
+        return mean, logvar
+
+
 class VAEPolicy(hk.Module):
     """
     Simple VAE policy.
@@ -187,12 +220,14 @@ class VAEPolicy(hk.Module):
         action_dim: int,
         latent_dim: int,
         is_continuous: bool = True,
+        sample_prior: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.action_dim = action_dim
         self.latent_dim = latent_dim
         self.is_continuous = is_continuous
+        self.sample_prior = sample_prior
 
         # encoder q(z|s)
         self.encoder = hk.Sequential(
@@ -214,6 +249,8 @@ class VAEPolicy(hk.Module):
             ]
         )
 
+        self.prior = StateConditionedPrior(latent_dim, hidden_size)
+
     def __call__(self, state: jnp.ndarray) -> jnp.ndarray:
         state_embed = self.encoder(state)
 
@@ -225,7 +262,15 @@ class VAEPolicy(hk.Module):
         std = jnp.exp(logvar) ** 0.5
         latent_dist = dist.Normal(loc=mean, scale=std)
 
+        prior_mean, prior_logvar = self.prior(state)
+        prior_logvar = jnp.clip(prior_logvar, -20, 2)
+        prior_std = jnp.exp(prior_logvar) ** 0.5
+        prior_dist = dist.Normal(prior_mean, prior_std)
+
         # sample latent from latent distribution
+        # if self.sample_prior:
+        #     latent = prior_dist.sample(seed=hk.next_rng_key())
+        # else:
         latent = latent_dist.sample(seed=hk.next_rng_key())
 
         # predict action from latent and state
@@ -243,7 +288,10 @@ class VAEPolicy(hk.Module):
 
         action = action_dist.sample(seed=hk.next_rng_key())
         return VAEActionOutput(
-            action=action, action_dist=action_dist, latent_dist=latent_dist
+            action=action,
+            action_dist=action_dist,
+            latent_dist=latent_dist,
+            prior_dist=prior_dist,
         )
 
 
@@ -271,6 +319,7 @@ def actor_critic_fn(
     is_continuous=True,
     policy_cls="gaussian",
     latent_dim=8,
+    sample_prior=False,
 ):
     if share_backbone:
         return SharedActorCritic(
@@ -278,5 +327,5 @@ def actor_critic_fn(
         )(obs)
     else:
         return ActorCritic(
-            action_dim, hidden_size, is_continuous, policy_cls, latent_dim
+            action_dim, hidden_size, is_continuous, policy_cls, latent_dim, sample_prior
         )(obs)

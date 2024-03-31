@@ -29,13 +29,14 @@ def get_config():
     config.gamma = 0.99
     config.entropy_weight = 0.01
     config.value_coeff = 0.5
+    config.prior_kl_weight = 0.0
 
     # value function
     config.baseline = False
     config.share_backbone = False
 
     # vae policy
-    config.latent_dim = 16
+    config.latent_dim = 8
     config.kl_div_weight = 1e-2
 
     # wandb
