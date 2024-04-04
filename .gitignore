@@ -9,3 +9,4 @@ ray_results/*
 videos/*
 configs/__pycache__/*
 wandb/*
+diffusion_rl.egg-info/*

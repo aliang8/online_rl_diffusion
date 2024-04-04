@@ -1,7 +1,5 @@
 python3 main.py \
-    --config=configs/base_config.py \
-    --config.entropy_weight=0.01 \
-    --config.share_backbone=True \
-    --config.baseline=True \
+    --config=configs/diffusion_config.py \
+    --config.env_id=halfcheetah-medium-v2 \
     --config.smoke_test=True \
-    --config.use_wb=True
+    --config.use_wb=False

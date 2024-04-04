@@ -1,12 +1,33 @@
-dm_haiku
-ml_collections
-optax 
-orbax
-matplotlib
-IPython
-ipdb
-imageio
-moviepy
+# math
+numpy
+scipy
+scikit-learn
+einops
+
+jupyterlab 
+jupyterlab_widgets
 ipywidgets
-gymnasium_robotics
+
 gymnasium
+matplotlib 
+tqdm 
+brax
+dm-acme[jax]
+dm-haiku
+orbax
+ray[tune]
+flax
+
+opencv-python
+moviepy
+
+# Logging
+wandb
+ipdb
+
+absl-py
+dataclasses
+ml_collections
+
+# Env
+xminigrid

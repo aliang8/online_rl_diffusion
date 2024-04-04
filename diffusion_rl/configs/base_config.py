@@ -1,23 +1,24 @@
 from ml_collections import ConfigDict, FieldReference, FrozenConfigDict, config_flags
 
 
-def get_config():
+def get_config(config_path: str = None):
     config = ConfigDict()
     config.seed = 0
     config.exp_name = "online_rl_diffusion"
-    config.root_dir = "/scr/aliang80/online_rl_diffusion"
+    config.root_dir = "/scr/aliang80/online_rl_diffusion/diffusion_rl"
+    config.exp_dir = "/scr/aliang80/online_rl_diffusion/diffusion_rl"
+
     config.video_dir = "videos"
     config.ckpt_dir = "model_ckpts"
     config.hidden_size = 128
     config.eval_every = 100
     config.save_every = 100
     config.num_training_episodes = 5000
-    config.num_eval_episodes = 10
+    config.num_eval_rollouts = 10
     config.results_dir = "results"
     config.mode = "train"
-    config.save_eval_video = False
-    config.num_eval_video_save = 2
-    config.policy = "gaussian"  # vae
+    config.visualize_rollouts = False
+    # config.policy = "gaussian"  # vae
 
     # env
     config.env_id = "CartPole-v1"  # "MountainCarContinuous-v0"
@@ -48,4 +49,8 @@ def get_config():
     config.notes = ""
     config.tags = ()
     config.visualize = False
+    config.log_level = "info"
+    config.enable_jit = True
+
+    config.skip_first_eval = False
     return config

@@ -14,16 +14,18 @@ import pickle
 import time
 import flax
 import re
+import collections
 from ml_collections import ConfigDict, FieldReference, FrozenConfigDict, config_flags
 from typing import Any
 import pickle
 from pathlib import Path
 from ray import train, tune
 from ray.train import RunConfig, ScalingConfig
-from trainer import BaseRLTrainer
-from vae_trainer import VAERLTrainer
+from diffusion_rl.trainers.trainer import BaseRLTrainer
+from diffusion_rl.trainers.vae_trainer import VAERLTrainer
+from diffusion_rl.trainers.offline_trainer import OfflineTrainer
 
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.01"
+# os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.01"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 _CONFIG = config_flags.DEFINE_config_file("config")
@@ -35,6 +37,22 @@ psh = {
     "policy_lr": "plr",
     "gamma": "g",
 }
+
+
+def update(source, overrides):
+    """
+    Update a nested dictionary or similar mapping.
+    Modify ``source`` in place.
+    """
+    for key, value in overrides.items():
+        if type(source[key]) != type(overrides[key]):
+            source[key] = overrides[key]
+        elif isinstance(value, collections.abc.Mapping) and value:
+            returned = update(source.get(key, {}), value)
+            source[key] = returned
+        else:
+            source[key] = overrides[key]
+    return source
 
 
 def train_model_fn(config):
@@ -57,12 +75,14 @@ def train_model_fn(config):
     config = ConfigDict(config)
 
     print(config)
-    if config.policy == "gaussian":
+    if config.trainer == "gaussian":
         trainer_cls = BaseRLTrainer
-    elif config.policy == "vae":
+    elif config.trainer == "vae":
         trainer_cls = VAERLTrainer
+    elif config.trainer == "offline":
+        trainer_cls = OfflineTrainer
     else:
-        raise ValueError(f"Policy {config.policy} not implemented")
+        raise ValueError(f"Trainer {config.trainer} not implemented")
 
     trainer = trainer_cls(config)
     if config.mode == "train":
@@ -82,14 +102,24 @@ param_space = {
 
 
 def trial_str_creator(trial):
-    trial_str = trial.config["exp_name"] + "_"
-    for k, v in trial.config.items():
-        if k in psh and k in param_space:
-            trial_str += f"{psh[k]}-{v}_"
-    # trial_str += str(trial.trial_id)
+    trial_str = ""
+
+    for k, override in param_space.items():
+        if k in trial.config:
+            if isinstance(override, dict) and "grid_search" not in override:
+                for k2 in override.keys():
+                    if k2 in trial.config[k]:
+                        trial_str += f"{psh[k][k2]}-{trial.config[k][k2]}_"
+            else:
+                trial_str += f"{psh[k]}-{trial.config[k]}_"
+
+    # also add keys to include
+    for k, v in trial.config["keys_to_include"].items():
+        for k2 in v:
+            trial_str += f"{k[0]}-{trial.config[k][k2]}_"
 
     trial_str = trial_str[:-1]
-    logging.info(f"trial_str: {trial_str}")
+    print("trial_str: ", trial_str)
     return trial_str
 
 
@@ -102,8 +132,8 @@ def main(_):
 
         run_config = RunConfig(
             name=config["exp_name"],
-            local_dir="/scr/aliang80/online_rl_diffusion/ray_results",
-            storage_path="/scr/aliang80/online_rl_diffusion/ray_results",
+            local_dir="/scr/aliang80/online_rl_diffusion/diffusion_rl/ray_results",
+            storage_path="/scr/aliang80/online_rl_diffusion/diffusion_rl/ray_results",
             log_to_file=True,
         )
         tuner = tune.Tuner(

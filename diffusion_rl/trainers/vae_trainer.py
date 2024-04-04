@@ -25,12 +25,12 @@ from typing import Any
 from tensorflow_probability.substrates import jax as tfp
 import pickle
 from pathlib import Path
-import utils
-from models import policy_fn, actor_critic_fn
+import diffusion_rl.utils.utils as utils
+from diffusion_rl.models.models import policy_fn, actor_critic_fn
 from ray import train, tune
 from ray.train import RunConfig, ScalingConfig
 import cv2
-from trainer import BaseRLTrainer
+from diffusion_rl.trainers.trainer import BaseRLTrainer
 from flax import traverse_util
 
 eps = jnp.finfo(jnp.float32).eps

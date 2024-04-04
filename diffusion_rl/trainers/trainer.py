@@ -17,18 +17,17 @@ from ml_collections import ConfigDict, FieldReference, FrozenConfigDict, config_
 from functools import partial
 from flax.training.train_state import TrainState
 from typing import Any
-import mlogger
 from tensorflow_probability.substrates import jax as tfp
 import pickle
 from pathlib import Path
-import utils
-from models import policy_fn, value_fn, actor_critic_fn
+import diffusion_rl.utils.utils as utils
+from diffusion_rl.models.models import policy_fn, value_fn, actor_critic_fn
 from ray import train, tune
 from ray.train import RunConfig, ScalingConfig
 import cv2
-import torch
+
+# import torch
 import wandb
-import equinox as eqx
 from flax import traverse_util
 import gymnasium as gym
 from collections import defaultdict as dd
@@ -43,7 +42,6 @@ class BaseRLTrainer:
 
         # set torch seed to maintain reproducibility
         np.random.seed(config.seed)
-        torch.manual_seed(config.seed)
 
         if self.config.use_wb:
             self.wandb_run = wandb.init(
