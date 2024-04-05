@@ -1,5 +1,17 @@
+# state-conditional action policy
 python3 main.py \
     --config=configs/diffusion_config.py \
     --config.env_id=halfcheetah-medium-v2 \
+    --config.smoke_test=True \
+    --config.visualize_rollouts=True \
+
+# learning generative model
+python3 main.py \
+    --config=configs/diffusion_config.py \
+    --config.exp_name=i003_gen_maze_xy \
+    --config.env_id=halfcheetah-medium-v2 \
     --config.smoke_test=False \
-    --config.visualize_rollouts=True
+    --config.trainer=generative \
+    --config.num_eval_rollouts=0 \
+    --config.policy.conditional=False \
+    --config.dataset=maze

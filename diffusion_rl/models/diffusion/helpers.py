@@ -9,32 +9,33 @@ from diffusion_rl.models.diffusion.model import DiffusionDDPM
 @hk.transform
 def diffusion_apply_fn(
     config: config_dict.ConfigDict,
-    states: jnp.ndarray,
     output_dim: int,
+    batch_size: int = None,
+    cond: jnp.ndarray = None,
 ):
     model = DiffusionDDPM(config, output_dim)
-    return model(cond=states)
+    return model(batch_size=batch_size, cond=cond)
 
 
 @hk.transform
 def diffusion_compute_loss_fn(
     config: config_dict.ConfigDict,
-    states: jnp.ndarray,
-    actions: jnp.ndarray,
+    input: jnp.ndarray,
+    cond: jnp.ndarray,
     output_dim: int,
 ):
     model = DiffusionDDPM(config, output_dim)
-    return model.loss(actions, states)
+    return model.loss(x=input, cond=cond)
 
 
 def init_params(
     config: config_dict.ConfigDict,
     rng: jax.random.PRNGKey,
-    state_dim: int,
+    input_dim: int,
     output_dim: int,
 ):
-    dummy_states = jnp.zeros((1, state_dim))
+    dummy_input = jnp.zeros((1, input_dim))
     params = diffusion_apply_fn.init(
-        rng, config=config, states=dummy_states, output_dim=output_dim
+        rng, config=config, cond=dummy_input, output_dim=output_dim
     )
     return params

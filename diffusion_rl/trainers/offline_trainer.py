@@ -19,23 +19,34 @@ from flax.training.train_state import TrainState
 from ml_collections.config_dict import ConfigDict, FrozenConfigDict
 from diffusion_rl.trainers.base_trainer import BaseTrainer
 import diffusion_rl.utils.general_utils as gutl
-from diffusion_rl.utils.utils import D4RLDataset
 from diffusion_rl.models.diffusion.helpers import init_params as init_params_diffusion
 from diffusion_rl.models.diffusion.helpers import (
     diffusion_apply_fn,
     diffusion_compute_loss_fn,
 )
 from diffusion_rl.utils.rollout import run_rollouts
+from diffusion_rl.utils.data import load_dataset
 
 
 def create_ts(
     config: ConfigDict,
     rng: jax.random.PRNGKey,
-    state_dim: int,
+    input_dim: int,
     output_dim: int,
 ):
+    if config.load_from_ckpt:
+        logging.info("loading model from checkpoint")
+        model_ckpt_dir = Path(config.root_dir) / config.model_ckpt_dir
+        ckpt_file = model_ckpt_dir / f"ckpt_{config.checkpoint_step}.pkl"
+
+        with open(ckpt_file, "rb") as f:
+            ckpt = pickle.load(f)
+            params = ckpt["ts_policy"]
+    else:
+        if config.policy.name == "diffusion":
+            params = init_params_diffusion(config.policy, rng, input_dim, output_dim)
+
     if config.policy.name == "diffusion":
-        params = init_params_diffusion(config.policy, rng, state_dim, output_dim)
         policy_fn = diffusion_apply_fn
 
     num_params = sum(p.size for p in jax.tree_util.tree_leaves(params))
@@ -48,7 +59,7 @@ def create_ts(
     policy_apply = functools.partial(
         jax.jit(
             policy_fn.apply,
-            static_argnames=("config", "output_dim"),
+            static_argnames=("config", "output_dim", "batch_size"),
         ),
         config=FrozenConfigDict(config.policy),
         output_dim=output_dim,
@@ -66,15 +77,18 @@ class OfflineTrainer(BaseTrainer):
         super().__init__(config)
 
         # load dataset
-        self.dataset = D4RLDataset(self.envs)
+        self.dataset = load_dataset(config, self.envs)
         logging.info(
-            f"loaded d4rl dataset, observation shape: {self.dataset.observations.shape}, action shape: {self.dataset.actions.shape}"
+            f"loaded dataset, observation shape: {self.dataset.observations.shape}, action shape: {self.dataset.actions.shape}"
         )
+
+        self.state_dim = self.dataset.observations.shape[-1]
+        self.action_dim = self.dataset.actions.shape[-1]
 
         self.ts_policy = create_ts(
             config,
             next(self.rng_seq),
-            state_dim=self.state_dim,
+            input_dim=self.state_dim,
             output_dim=self.action_dim,
         )
 
@@ -88,28 +102,25 @@ class OfflineTrainer(BaseTrainer):
         )
 
         def loss_fn(params, ts, batch, rng):
-            # action_preds = ts.apply_fn(
-            #     params,
-            #     rng,
-            #     states=batch.observations.astype(jnp.float32),
-            # )
-
-            # if self.continuous_actions:
-            #     # compute MSE loss
-            #     loss = optax.squared_error(action_preds, batch.actions)
-            # else:
-            #     # compute cross entropy with logits
-            #     loss = optax.softmax_cross_entropy_with_integer_labels(
-            #         action_preds, batch.actions.squeeze(axis=-1).astype(jnp.int32)
-            #     )
-            loss = self.compute_loss(
-                params, rng, states=batch.observations, actions=batch.actions
+            action_preds = ts.apply_fn(
+                params,
+                rng,
+                cond=batch.observations.astype(jnp.float32),
             )
-            loss = jnp.mean(loss)
 
-            metrics = {
-                "bc_loss": loss,
-            }
+            if self.continuous_actions:
+                # compute MSE loss
+                loss = optax.squared_error(action_preds, batch.actions)
+            else:
+                # compute cross entropy with logits
+                loss = optax.softmax_cross_entropy_with_integer_labels(
+                    action_preds, batch.actions.squeeze(axis=-1).astype(jnp.int32)
+                )
+            # loss = self.compute_loss(
+            #     params, rng, states=batch.observations, actions=batch.actions
+            # )
+            loss = jnp.mean(loss)
+            metrics = {"bc_loss": loss}
 
             return loss, metrics
 
@@ -195,7 +206,6 @@ class OfflineTrainer(BaseTrainer):
         #     eval_metrics[k] = jnp.mean(jnp.array(v))
 
         # run rollouts
-        rollout_start = time.time()
         rollout_metrics = run_rollouts(
             rng=next(self.rng_seq),
             env=self.eval_envs,
@@ -203,7 +213,5 @@ class OfflineTrainer(BaseTrainer):
             ts_policy=self.ts_policy,
             wandb_run=self.wandb_run,
         )
-        rollout_time = time.time() - rollout_start
-        rollout_metrics["time/rollouts"] = rollout_time / self.config.num_eval_rollouts
         eval_metrics.update(rollout_metrics)
         return eval_metrics

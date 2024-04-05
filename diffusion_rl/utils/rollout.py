@@ -3,6 +3,7 @@ import gym
 import jax
 import wandb
 import tqdm
+import time
 import einops
 import numpy as np
 from flax.training.train_state import TrainState
@@ -19,6 +20,7 @@ def run_rollouts(
 
     videos = []
     max_action = float(env.action_space.high[0])
+    start = time.time()
 
     for _ in tqdm.tqdm(range(config.num_eval_rollouts)):
         observation, done = env.reset(), False
@@ -38,9 +40,7 @@ def run_rollouts(
 
         while not done and t < env.spec.max_episode_steps:
             rng, policy_rng = jax.random.split(rng)
-            action = ts_policy.apply_fn(
-                ts_policy.params, policy_rng, states=observation
-            )
+            action = ts_policy.apply_fn(ts_policy.params, policy_rng, cond=observation)
             action = np.clip(action, -max_action, max_action)
 
             observation, reward, done, info = env.step(np.array(action).squeeze(axis=0))
@@ -72,6 +72,9 @@ def run_rollouts(
 
     stats["norm_return"] = avg_norm_score
     stats["std_norm_return"] = std_norm_score
+
+    end = time.time()
+    stats["time"] = end - start
 
     if wandb_run is not None and config.visualize_rollouts:
         # generate the images

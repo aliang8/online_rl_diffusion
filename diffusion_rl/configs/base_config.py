@@ -53,4 +53,9 @@ def get_config(config_path: str = None):
     config.enable_jit = True
 
     config.skip_first_eval = False
+
+    # resume training
+    config.load_from_ckpt = False
+    config.checkpoint_step = 100
+    config.model_ckpt_dir = ""
     return config

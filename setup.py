@@ -38,7 +38,7 @@ setup(
     long_description_content_type="text/markdown",
     author="Anthony Liang",
     packages=find_packages(exclude=["tests", ".github"]),
-    install_requires=read_requirements("requirements.txt"),
+    # install_requires=read_requirements("requirements.txt"),
     # entry_points={
     #     "console_scripts": ["varibad_jax = varibad_jax.__main__:main"]
     # },

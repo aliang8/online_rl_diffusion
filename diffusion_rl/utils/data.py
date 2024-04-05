@@ -11,26 +11,7 @@ import numpy as np
 from flax.training.train_state import TrainState
 from typing import Any, Callable
 from flax import core, struct
-
-
-def create_learning_rate_fn(
-    num_epochs, warmup_epochs, base_learning_rate, steps_per_epoch
-):
-    """Creates learning rate schedule."""
-    warmup_fn = optax.linear_schedule(
-        init_value=0.0,
-        end_value=base_learning_rate,
-        transition_steps=warmup_epochs * steps_per_epoch,
-    )
-    cosine_epochs = max(num_epochs - warmup_epochs, 1)
-    cosine_fn = optax.cosine_decay_schedule(
-        init_value=base_learning_rate, decay_steps=cosine_epochs * steps_per_epoch
-    )
-    schedule_fn = optax.join_schedules(
-        schedules=[warmup_fn, cosine_fn],
-        boundaries=[warmup_epochs * steps_per_epoch],
-    )
-    return schedule_fn
+from changepoint_aug.density_estimation.data import load_pkl_dataset
 
 
 @chex.dataclass
@@ -128,3 +109,36 @@ class D4RLDataset(Dataset):
             next_observations=dataset["next_observations"].astype(np.float32),
             size=len(dataset["observations"]),
         )
+
+
+def load_dataset(config, envs):
+    if config.dataset == "d4rl":
+        # load dataset
+        dataset = D4RLDataset(envs)
+    elif config.dataset == "maze":
+        data_dir = (
+            "/scr/aliang80/changepoint_aug/changepoint_aug/density_estimation/datasets"
+        )
+        data_file = "sac_maze_200.pkl"
+        dataset, *_ = load_pkl_dataset(
+            data_dir,
+            data_file,
+            config.num_trajs,
+            config.batch_size,
+            train_perc=1.0,
+            env="MAZE",
+            augmentation_data=[],
+            num_augmentation_steps=0,
+        )
+        obs, next_obs, actions, next_actions, rewards, dones = dataset[:]
+        dataset = Dataset(
+            observations=np.array(obs),
+            actions=np.array(actions),
+            rewards=np.array(rewards),
+            masks=1.0 - np.array(dones),
+            dones_float=np.array(dones),
+            next_observations=np.array(next_obs),
+            size=obs.shape[0],
+        )
+
+    return dataset

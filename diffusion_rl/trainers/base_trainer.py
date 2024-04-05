@@ -28,6 +28,7 @@ class BaseTrainer:
 
         self.global_step = 0
         self.rng_seq = hk.PRNGSequence(config.seed)
+        np.random.seed(config.seed)
 
         if self.config.use_wb:
             self.wandb_run = wandb.init(
@@ -45,7 +46,7 @@ class BaseTrainer:
             self.wandb_run = None
 
         # setup log dirs
-        self.exp_dir = Path(self.config.exp_dir) / self.config.exp_name
+        self.exp_dir = Path(self.config.exp_dir)
         print("experiment dir: ", self.exp_dir)
 
         self.ckpt_dir = self.exp_dir / "model_ckpts"

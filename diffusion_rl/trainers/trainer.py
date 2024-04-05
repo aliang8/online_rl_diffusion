@@ -20,7 +20,8 @@ from typing import Any
 from tensorflow_probability.substrates import jax as tfp
 import pickle
 from pathlib import Path
-import diffusion_rl.utils.utils as utils
+
+# import diffusion_rl.utils.data as data
 from diffusion_rl.models.models import policy_fn, value_fn, actor_critic_fn
 from ray import train, tune
 from ray.train import RunConfig, ScalingConfig
@@ -74,7 +75,7 @@ class BaseRLTrainer:
         self.jit_update_step = jax.jit(self.update_step)
 
         # create environment
-        self.train_env = utils.make_env(self.config.env_id, seed=self.config.seed)
+        self.train_env = data.make_env(self.config.env_id, seed=self.config.seed)
         self.obs_dim = self.train_env.observation_space.shape[0]
         self.is_continuous = isinstance(self.train_env.action_space, gym.spaces.Box)
 
@@ -87,7 +88,7 @@ class BaseRLTrainer:
         print(f"continuous action space: {self.is_continuous}")
 
         # create test environment
-        self.test_env = utils.make_env(self.config.env_id, seed=self.config.seed + 100)
+        self.test_env = data.make_env(self.config.env_id, seed=self.config.seed + 100)
 
         self.ts = self.create_ts(next(self.rng_seq))
 
@@ -199,7 +200,7 @@ class BaseRLTrainer:
         # jax.debug.breakpoint()
         mask = np.ones_like(np.array(rewards))
 
-        trajectory = utils.Trajectory(
+        trajectory = data.Trajectory(
             states=np.array(states),
             actions=np.array(actions),
             rewards=np.array(rewards),

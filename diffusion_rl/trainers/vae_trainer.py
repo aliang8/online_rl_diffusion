@@ -25,7 +25,8 @@ from typing import Any
 from tensorflow_probability.substrates import jax as tfp
 import pickle
 from pathlib import Path
-import diffusion_rl.utils.utils as utils
+
+# import diffusion_rl.utils.data as data
 from diffusion_rl.models.models import policy_fn, actor_critic_fn
 from ray import train, tune
 from ray.train import RunConfig, ScalingConfig
