@@ -36,6 +36,16 @@ psh = {
     "seed": "s",
     "policy_lr": "plr",
     "gamma": "g",
+    "env_id": "eid",
+    "num_epochs": "ne",
+    "num_iter_per_epoch": "iters",
+    "policy": {
+        "name": "p",
+        "n_timesteps": "nt",
+        "beta_schedule": "bs",
+        "time_embed_dim": "ted",
+        "conditional": "cond",
+    },
 }
 
 
@@ -61,7 +71,7 @@ def train_model_fn(config):
     if trial_dir:
         # this is if we are running with Ray
         logging.info("trial dir: ", trial_dir)
-        config["root_dir"] = Path(trial_dir)
+        config["exp_dir"] = Path(trial_dir)
         base_name = Path(trial_dir).name
         config["exp_name"] = base_name
         # the group name is without seed
@@ -69,7 +79,7 @@ def train_model_fn(config):
         logging.info(f"wandb group name: {config['group_name']}")
     else:
         suffix = f"{config['exp_name']}_s-{config['seed']}_t-{config['policy']}"
-        config["root_dir"] = Path(config["root_dir"]) / "results" / suffix
+        config["exp_dir"] = Path(config["exp_dir"]) / "results" / suffix
 
     # wrap config in ConfigDict
     config = ConfigDict(config)
@@ -92,12 +102,13 @@ def train_model_fn(config):
 
 
 param_space = {
-    # "latent_dim": tune.grid_search([5, 8]),
-    # "kl_div_weight": tune.grid_search([1.0, 1e-1, 1e-2]),
-    "entropy_weight": tune.grid_search([0.0]),
-    "seed": tune.grid_search([0, 1, 2]),
-    "policy_lr": tune.grid_search([3e-4, 1e-4]),
-    "gamma": tune.grid_search([0.99, 0.999]),
+    "env_id": tune.grid_search(
+        [
+            "halfcheetah-medium-v2",
+            "halfcheetah-medium-expert-v2",
+            "halfcheetah-medium-replay-v2",
+        ]
+    )
 }
 
 
@@ -115,8 +126,11 @@ def trial_str_creator(trial):
 
     # also add keys to include
     for k, v in trial.config["keys_to_include"].items():
-        for k2 in v:
-            trial_str += f"{k[0]}-{trial.config[k][k2]}_"
+        if v is None:
+            trial_str += f"{psh[k]}-{trial.config[k]}_"
+        else:
+            for k2 in v:
+                trial_str += f"{psh[k][k2]}-{trial.config[k][k2]}_"
 
     trial_str = trial_str[:-1]
     print("trial_str: ", trial_str)
@@ -126,6 +140,7 @@ def trial_str_creator(trial):
 def main(_):
     config = _CONFIG.value.to_dict()
     if config["smoke_test"] is False:
+        config["use_wb"] = True
         # run with ray tune
         config.update(param_space)
         train_model = tune.with_resources(train_model_fn, {"cpu": 4, "gpu": 0.1})

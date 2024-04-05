@@ -21,15 +21,21 @@ from diffusion_rl.trainers.base_trainer import BaseTrainer
 import diffusion_rl.utils.general_utils as gutl
 from diffusion_rl.utils.utils import D4RLDataset
 from diffusion_rl.models.diffusion.helpers import init_params as init_params_diffusion
-from diffusion_rl.models.diffusion.helpers import diffusion_apply_fn
+from diffusion_rl.models.diffusion.helpers import (
+    diffusion_apply_fn,
+    diffusion_compute_loss_fn,
+)
 from diffusion_rl.utils.rollout import run_rollouts
 
 
-def create_ts(config: ConfigDict, rng, envs, state_dim, action_dim, max_action):
+def create_ts(
+    config: ConfigDict,
+    rng: jax.random.PRNGKey,
+    state_dim: int,
+    output_dim: int,
+):
     if config.policy.name == "diffusion":
-        params = init_params_diffusion(
-            config.policy, rng, state_dim, action_dim, max_action
-        )
+        params = init_params_diffusion(config.policy, rng, state_dim, output_dim)
         policy_fn = diffusion_apply_fn
 
     num_params = sum(p.size for p in jax.tree_util.tree_leaves(params))
@@ -42,12 +48,10 @@ def create_ts(config: ConfigDict, rng, envs, state_dim, action_dim, max_action):
     policy_apply = functools.partial(
         jax.jit(
             policy_fn.apply,
-            static_argnames=("config", "state_dim", "action_dim", "max_action"),
+            static_argnames=("config", "output_dim"),
         ),
         config=FrozenConfigDict(config.policy),
-        state_dim=state_dim,
-        action_dim=action_dim,
-        max_action=max_action,
+        output_dim=output_dim,
     )
     ts = TrainState.create(
         apply_fn=policy_apply,
@@ -70,28 +74,37 @@ class OfflineTrainer(BaseTrainer):
         self.ts_policy = create_ts(
             config,
             next(self.rng_seq),
-            self.envs,
             state_dim=self.state_dim,
-            action_dim=self.action_dim,
-            max_action=float(self.envs.action_space.high[0]),
+            output_dim=self.action_dim,
+        )
+
+        self.compute_loss = functools.partial(
+            jax.jit(
+                diffusion_compute_loss_fn.apply,
+                static_argnames=("config", "output_dim"),
+            ),
+            config=FrozenConfigDict(config.policy),
+            output_dim=self.action_dim,
         )
 
         def loss_fn(params, ts, batch, rng):
-            action_preds = ts.apply_fn(
-                params,
-                rng,
-                states=batch.observations.astype(jnp.float32),
+            # action_preds = ts.apply_fn(
+            #     params,
+            #     rng,
+            #     states=batch.observations.astype(jnp.float32),
+            # )
+
+            # if self.continuous_actions:
+            #     # compute MSE loss
+            #     loss = optax.squared_error(action_preds, batch.actions)
+            # else:
+            #     # compute cross entropy with logits
+            #     loss = optax.softmax_cross_entropy_with_integer_labels(
+            #         action_preds, batch.actions.squeeze(axis=-1).astype(jnp.int32)
+            #     )
+            loss = self.compute_loss(
+                params, rng, states=batch.observations, actions=batch.actions
             )
-
-            if self.continuous_actions:
-                # compute MSE loss
-                loss = optax.squared_error(action_preds, batch.actions)
-            else:
-                # compute cross entropy with logits
-                loss = optax.softmax_cross_entropy_with_integer_labels(
-                    action_preds, batch.actions.squeeze(axis=-1).astype(jnp.int32)
-                )
-
             loss = jnp.mean(loss)
 
             metrics = {

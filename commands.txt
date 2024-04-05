@@ -1,5 +1,5 @@
 python3 main.py \
     --config=configs/diffusion_config.py \
     --config.env_id=halfcheetah-medium-v2 \
-    --config.smoke_test=True \
-    --config.use_wb=False
+    --config.smoke_test=False \
+    --config.visualize_rollouts=True

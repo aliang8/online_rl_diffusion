@@ -1,6 +1,7 @@
 import copy
 import numpy as np
 import jax
+import optax
 import jax.numpy as jnp
 import haiku as hk
 from ml_collections import config_dict
@@ -16,14 +17,15 @@ from diffusion_rl.models.diffusion.utils import (
 class NoiseModel(hk.Module):
     def __init__(
         self,
-        state_dim: int,
-        action_dim: int,
+        output_dim: int,
         hidden_size: int,
         time_embed_dim: int,
+        conditional: bool,
         w_init: hk.initializers.Initializer,
         b_init: hk.initializers.Initializer,
     ):
         super().__init__()
+        self.conditional = conditional
         init_kwargs = dict(w_init=w_init, b_init=b_init)
         self.time_mlp = hk.Sequential(
             [
@@ -40,33 +42,32 @@ class NoiseModel(hk.Module):
                 jax.nn.gelu,
                 hk.Linear(hidden_size, **init_kwargs),
                 jax.nn.gelu,
-                hk.Linear(action_dim, **init_kwargs),
+                hk.Linear(output_dim, **init_kwargs),
             ]
         )
 
-    def __call__(self, x, time, state):
+    def __call__(self, x, time, cond=None):
         t = self.time_mlp(time)
-        x = jnp.concatenate([x, t, state], axis=1)
+        if self.conditional and cond is not None:
+            x = jnp.concatenate([x, t, cond], axis=1)
+        else:
+            x = jnp.concatenate([x, t], axis=1)
         x = self.net(x)
         return x
 
 
-class Diffusion(hk.Module):
+class DiffusionDDPM(hk.Module):
     def __init__(
         self,
         config: config_dict.ConfigDict,
-        state_dim: int,
-        action_dim: int,
-        max_action: int,
+        output_dim: int,
         w_init: hk.initializers.Initializer = hk.initializers.VarianceScaling(2.0),
         b_init: hk.initializers.Initializer = hk.initializers.Constant(0.0),
     ):
         super().__init__()
 
         self.config = config
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.max_action = max_action
+        self.output_dim = output_dim
 
         if self.config.beta_schedule == "linear":
             self.betas = linear_beta_schedule(self.config.n_timesteps)
@@ -108,10 +109,10 @@ class Diffusion(hk.Module):
         )
 
         self.noise_model = NoiseModel(
-            state_dim=state_dim,
-            action_dim=action_dim,
+            output_dim=self.output_dim,
             hidden_size=self.config.hidden_size,
             time_embed_dim=self.config.time_embed_dim,
+            conditional=self.config.conditional,
             w_init=w_init,
             b_init=b_init,
         )
@@ -142,22 +143,18 @@ class Diffusion(hk.Module):
         )
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_mean_variance(self, x, t, s):
-        x_recon = self.predict_start_from_noise(x, t=t, noise=self.noise_model(x, t, s))
-
-        if self.config.clip_denoised:
-            jnp.clip(x_recon, -self.max_action, self.max_action)
-        else:
-            assert RuntimeError()
-
+    def p_mean_variance(self, x, t, cond=None):
+        x_recon = self.predict_start_from_noise(
+            x, t=t, noise=self.noise_model(x, t, cond)
+        )
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(
             x_start=x_recon, x_t=x, t=t
         )
         return model_mean, posterior_variance, posterior_log_variance
 
-    def p_sample(self, x, t, s):
+    def p_sample(self, x, t, cond=None):
         b, *_ = x.shape
-        model_mean, _, model_log_variance = self.p_mean_variance(x=x, t=t, s=s)
+        model_mean, _, model_log_variance = self.p_mean_variance(x=x, t=t, cond=cond)
 
         noise = jax.random.normal(hk.next_rng_key(), shape=x.shape)
 
@@ -167,19 +164,23 @@ class Diffusion(hk.Module):
         )
         return model_mean + nonzero_mask * jnp.exp(0.5 * model_log_variance) * noise
 
-    def p_sample_loop(self, state, shape, return_diffusion=False):
+    def __call__(self, batch_size=None, cond=None, return_diffusion=False):
         """
         sample from the inverse diffusion process, starting from x_t ~ N(0, I)
         """
-        batch_size = shape[0]
-        x = jax.random.normal(hk.next_rng_key(), shape=shape)
+        if cond is not None:
+            batch_size = cond.shape[0]
+        else:
+            assert batch_size is not None
+
+        x = jax.random.normal(hk.next_rng_key(), shape=(batch_size, self.output_dim))
 
         if return_diffusion:
             diffusion = [x]
 
         for i in reversed(range(0, self.config.n_timesteps)):
             timesteps = jnp.full((batch_size,), i, dtype=jnp.int32)
-            x = self.p_sample(x, timesteps, state)
+            x = self.p_sample(x, timesteps, cond)
 
             if return_diffusion:
                 diffusion.append(x)
@@ -188,12 +189,6 @@ class Diffusion(hk.Module):
             return x, jnp.stack(diffusion, axis=1)
         else:
             return x
-
-    def sample(self, state, *args, **kwargs):
-        batch_size = state.shape[0]
-        shape = (batch_size, self.action_dim)
-        action = self.p_sample_loop(state, shape, *args, **kwargs)
-        return jnp.clip(action, -self.max_action, self.max_action)
 
     # ------------------------------------------ training ------------------------------------------#
 
@@ -208,28 +203,20 @@ class Diffusion(hk.Module):
 
         return sample
 
-    def p_losses(self, x_start, state, t, weights=1.0):
-        noise = jax.random.normal(hk.next_rng_key(), shape=x_start.shape)
-
-        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-
-        x_recon = self.model(x_noisy, t, state)
-
-        assert noise.shape == x_recon.shape
-
-        if self.config.predict_epsilon:
-            loss = self.loss_fn(x_recon, noise, weights)
-        else:
-            loss = self.loss_fn(x_recon, x_start, weights)
-
-        return loss
-
-    def loss(self, x, state, weights=1.0):
+    def loss(self, x, cond=None):
         batch_size = len(x)
         t = jax.random.randint(
             hk.next_rng_key(), (batch_size,), 0, self.config.n_timesteps
         )
-        return self.p_losses(x, state, t, weights)
+        noise = jax.random.normal(hk.next_rng_key(), shape=x.shape)
 
-    def __call__(self, state, *args, **kwargs):
-        return self.sample(state, *args, **kwargs)
+        x_noisy = self.q_sample(x_start=x, t=t, noise=noise)
+        x_recon = self.noise_model(x_noisy, t, cond)
+
+        assert noise.shape == x_recon.shape
+
+        if self.config.predict_epsilon:
+            loss = optax.squared_error(x_recon, noise)
+        else:
+            loss = optax.squared_error(x_recon, x)
+        return loss

@@ -18,6 +18,7 @@ def run_rollouts(
     stats = {"return": [], "length": []}
 
     videos = []
+    max_action = float(env.action_space.high[0])
 
     for _ in tqdm.tqdm(range(config.num_eval_rollouts)):
         observation, done = env.reset(), False
@@ -40,6 +41,7 @@ def run_rollouts(
             action = ts_policy.apply_fn(
                 ts_policy.params, policy_rng, states=observation
             )
+            action = np.clip(action, -max_action, max_action)
 
             observation, reward, done, info = env.step(np.array(action).squeeze(axis=0))
             episode_return += reward
@@ -61,8 +63,15 @@ def run_rollouts(
         if config.visualize_rollouts:
             videos.append(np.stack(imgs))
 
+    normalized_scores = [env.get_normalized_score(s) for s in stats["return"]]
+    avg_norm_score = env.get_normalized_score(np.mean(stats["return"])) * 100
+    std_norm_score = np.std(normalized_scores)
+
     for k, v in stats.items():
         stats[k] = np.mean(v)
+
+    stats["norm_return"] = avg_norm_score
+    stats["std_norm_return"] = std_norm_score
 
     if wandb_run is not None and config.visualize_rollouts:
         # generate the images

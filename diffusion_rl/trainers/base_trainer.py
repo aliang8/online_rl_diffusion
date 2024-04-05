@@ -39,6 +39,7 @@ class BaseTrainer:
                 tags=self.config.tags,
                 # track hyperparameters and run metadata
                 config=self.config,
+                group=self.config.group_name,
             )
         else:
             self.wandb_run = None
