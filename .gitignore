@@ -10,3 +10,4 @@ videos/*
 configs/__pycache__/*
 wandb/*
 diffusion_rl.egg-info/*
+diffusion_rl/wandb/*

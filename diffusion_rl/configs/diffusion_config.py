@@ -5,9 +5,17 @@ from ml_collections.config_dict import ConfigDict
 def get_config(config_string: str = None):
     config = get_base_config(config_string)
     config.trainer = "offline"
+    config.env_id = "halfcheetah-medium-v2"
 
     config.lr = 3e-4
     config.eps = 1e-8
+    config.num_epochs = 1000
+    config.num_iter_per_epoch = 100
+    config.batch_size = 256
+
+    # for rendering images
+    config.width = 100
+    config.height = 100
 
     policy_config = ConfigDict()
     policy_config.name = "diffusion"

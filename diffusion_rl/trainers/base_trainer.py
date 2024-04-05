@@ -54,7 +54,9 @@ class BaseTrainer:
 
         # create env
         self.envs = gym.make(config.env_id).unwrapped
+        self.envs.seed(config.seed)
         self.eval_envs = gym.make(config.env_id).unwrapped
+        self.eval_envs.seed(config.seed + 100)
 
         self.obs_shape = self.envs.observation_space.shape
         self.state_dim = self.obs_shape[0]

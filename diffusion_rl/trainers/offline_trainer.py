@@ -62,18 +62,18 @@ class OfflineTrainer(BaseTrainer):
         super().__init__(config)
 
         # load dataset
-        dataset = D4RLDataset(self.envs)
+        self.dataset = D4RLDataset(self.envs)
         logging.info(
-            f"loaded d4rl dataset, observation shape: {dataset.observations.shape}, action shape: {dataset.actions.shape}"
+            f"loaded d4rl dataset, observation shape: {self.dataset.observations.shape}, action shape: {self.dataset.actions.shape}"
         )
 
         self.ts_policy = create_ts(
             config,
             next(self.rng_seq),
             self.envs,
-            self.state_dim,
-            self.action_dim,
-            float(self.envs.action_space.high[0]),
+            state_dim=self.state_dim,
+            action_dim=self.action_dim,
+            max_action=float(self.envs.action_space.high[0]),
         )
 
         def loss_fn(params, ts, batch, rng):
@@ -124,7 +124,7 @@ class OfflineTrainer(BaseTrainer):
             # iterate over batches of data
             start_time = time.time()
             epoch_metrics = dd(list)
-            for _ in range(self.num_train_batches):
+            for _ in range(self.config.num_iter_per_epoch):
                 self.ts_policy, metrics = self.jit_update_step(
                     self.ts_policy,
                     self.dataset.sample(self.config.batch_size),
@@ -145,10 +145,24 @@ class OfflineTrainer(BaseTrainer):
                 self.wandb_run.log(metrics)
 
             if (epoch + 1) % self.config.eval_interval == 0:
+                logging.info("running evaluation")
                 eval_metrics = self.eval()
                 if self.wandb_run is not None:
                     eval_metrics = gutl.prefix_dict_keys(eval_metrics, prefix="eval/")
                     self.wandb_run.log(eval_metrics)
+
+            if (epoch + 1) % self.config.save_interval == 0:
+                # save to pickle
+                ckpt_file = Path(self.ckpt_dir) / f"ckpt_{epoch + 1}.pkl"
+                logging.debug(f"saving checkpoint to {ckpt_file}")
+                with open(ckpt_file, "wb") as f:
+                    pickle.dump(
+                        {
+                            "config": self.config.to_dict(),
+                            "ts_policy": self.ts_policy.params,
+                        },
+                        f,
+                    )
 
     def eval(self):
         eval_metrics = dd(list)
